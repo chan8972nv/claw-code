@@ -503,8 +503,46 @@ fn get_simple_doing_tasks_section() -> String {
         "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
     ]);
 
+    let tool_items = prepend_bullets(vec![
+        "bash: Execute shell commands with optional timeout and background mode. Use for running tests, installing packages, and system operations. Avoid using it for tasks that have a dedicated tool (searching, reading, editing).".to_string(),
+        "read_file: Read file contents with optional offset/limit for pagination. Supports text files, images, and PDFs. Prefer this over bash cat/head/tail.".to_string(),
+        "write_file: Create or overwrite files. Use only for new files; prefer edit_file for modifying existing ones.".to_string(),
+        "edit_file: Surgical find-and-replace edits in existing files. Requires unique old_string match; supports replace_all for bulk renames. Prefer this over bash sed/awk.".to_string(),
+        "glob_search: Fast file discovery by glob pattern (e.g., **/*.py). Use to discover project layout before reading files.".to_string(),
+        "grep_search: Regex content search powered by ripgrep. Supports file type filters, context lines, and output modes (content, files_with_matches, count). Prefer this over bash grep/rg — it produces compact output and conserves context.".to_string(),
+        "REPL: Execute code snippets directly in python (python3 -c), javascript (node -e), or bash (bash -lc). Use for quick validation instead of bash python -c.".to_string(),
+        "WebFetch: Fetch a URL and return its contents with an optional prompt to extract specific information.".to_string(),
+        "WebSearch: Search the web with a query. Supports allowed_domains and blocked_domains filtering.".to_string(),
+        "TodoWrite: Manage a structured task list for the session with status tracking (pending/in_progress/completed).".to_string(),
+        "Agent: Spawn sub-agent threads with isolated tool sets. Supports agent types (General, Explore, Verification) each with a filtered tool allowlist.".to_string(),
+        "NotebookEdit: Edit Jupyter notebook cells with replace, insert, and delete modes for code or markdown cells.".to_string(),
+        "ToolSearch: Search for deferred/specialized tools by keyword or exact name. Returns full schema so the tool becomes callable.".to_string(),
+        "Skill: Load and execute local skill definitions (e.g., /commit, /pr) from configured skill directories.".to_string(),
+    ]);
+
+    let tool_guidance = prepend_bullets(vec![
+        // Core tool preferences over bash
+        "Minimize bash usage — prefer the dedicated tools which are faster, produce less output, and conserve context.".to_string(),
+        "Use grep_search instead of bash grep/rg for searching file contents. It returns compact, structured results.".to_string(),
+        "Use glob_search to discover project layout and find files by pattern before reading them.".to_string(),
+        "Use read_file with offset/limit for large files instead of bash cat/head/tail. This avoids flooding context with unnecessary content.".to_string(),
+        "Use edit_file for surgical edits instead of write_file or bash sed/awk. It ensures precise, reviewable changes.".to_string(),
+        "Use REPL for quick Python/JS validation instead of bash python -c. It runs code directly without shell quoting issues.".to_string(),
+        // Web tools
+        "Use WebFetch to retrieve documentation, API references, or error explanations from URLs. Avoids relying on bash curl which dumps raw HTML.".to_string(),
+        "Use WebSearch when you need to look up error messages, library APIs, or unfamiliar patterns. Faster than guessing.".to_string(),
+        // Task management
+        "Use TodoWrite to track multi-step plans. Break complex tasks into pending/in_progress/completed items so progress survives compaction.".to_string(),
+        // Advanced tools
+        "Use Agent to delegate independent sub-tasks (e.g., searching a large codebase, running verification) in parallel without bloating the main context.".to_string(),
+        "Use NotebookEdit when modifying Jupyter notebooks — do not rewrite the entire .ipynb with write_file.".to_string(),
+        "Use ToolSearch to discover specialized tools when built-in tools are insufficient for the task.".to_string(),
+        "Use Skill to invoke predefined workflows (e.g., /commit, /pr) instead of manually assembling multi-step bash sequences.".to_string(),
+    ]);
+
     std::iter::once("# Doing tasks".to_string())
         .chain(items)
+        .chain(std::iter::once("\n# Available tools".to_string()))
         .collect::<Vec<_>>()
         .join("\n")
 }

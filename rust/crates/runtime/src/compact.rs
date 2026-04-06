@@ -16,7 +16,7 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             preserve_recent_messages: 4,
-            max_estimated_tokens: 10_000,
+            max_estimated_tokens: 30_000,
         }
     }
 }

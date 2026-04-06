@@ -224,13 +224,9 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
     }
-    // When OPENAI_BASE_URL is set, the user explicitly configured an
-    // OpenAI-compatible endpoint. Prefer it over the Anthropic fallback
-    // even when the model name has no recognized prefix — this is the
-    // common case for local providers (Ollama, LM Studio, vLLM, etc.)
-    // where model names like "qwen2.5-coder:7b" don't match any prefix.
-    if std::env::var_os("OPENAI_BASE_URL").is_some() && openai_compat::has_api_key("OPENAI_API_KEY")
-    {
+    // When OPENAI_BASE_URL is set and the model is unrecognized, prefer
+    // OpenAI-compat so that vLLM / Ollama / custom endpoints work.
+    if std::env::var("OPENAI_BASE_URL").is_ok() {
         return ProviderKind::OpenAi;
     }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
@@ -258,7 +254,7 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
             if canonical.contains("opus") {
                 32_000
             } else {
-                64_000
+                32_000
             }
         },
         |limit| limit.max_output_tokens,
@@ -613,7 +609,7 @@ mod tests {
     #[test]
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
-        assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+        assert_eq!(max_tokens_for_model("grok-3"), 32_000);
     }
 
     #[test]

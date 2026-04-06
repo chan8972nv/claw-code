@@ -2,6 +2,14 @@ use runtime::{pricing_for_model, TokenUsage, UsageCostEstimate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingConfig {
+    Adaptive,
+    Enabled { budget_tokens: u32 },
+    Disabled,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MessageRequest {
     pub model: String,
@@ -31,6 +39,8 @@ pub struct MessageRequest {
     /// Silently ignored by backends that do not support it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
 }
 
 impl MessageRequest {

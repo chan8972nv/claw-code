@@ -25,7 +25,7 @@ impl ProviderClient {
         let resolved_model = providers::resolve_model_alias(model);
         match providers::detect_provider_kind(&resolved_model) {
             ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
-                Some(auth) => AnthropicClient::from_auth(auth),
+                Some(auth) => AnthropicClient::from_auth(auth).with_base_url(read_base_url()),
                 None => AnthropicClient::from_env()?,
             })),
             ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
