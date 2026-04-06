@@ -93,20 +93,18 @@ impl ApiError {
     #[must_use]
     pub fn safe_failure_class(&self) -> &'static str {
         match self {
+            Self::RetriesExhausted { .. } => "provider_retry_exhausted",
             Self::MissingCredentials { .. } | Self::ExpiredOAuthToken | Self::Auth(_) => {
                 "provider_auth"
             }
             Self::Api { status, .. } if matches!(status.as_u16(), 401 | 403) => "provider_auth",
             Self::ContextWindowExceeded { .. } => "context_window",
             Self::Api { status, .. } if status.as_u16() == 429 => "provider_rate_limit",
-            Self::Api { .. } | Self::RetriesExhausted { .. } if self.is_generic_fatal_wrapper() => {
-                "provider_internal"
-            }
+            Self::Api { .. } if self.is_generic_fatal_wrapper() => "provider_internal",
             Self::Api { .. } => "provider_error",
             Self::Http(_) | Self::InvalidSseFrame(_) | Self::BackoffOverflow { .. } => {
                 "provider_transport"
             }
-            Self::RetriesExhausted { .. } => "provider_retry_exhausted",
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json(_) => "runtime_io",
         }
     }
@@ -173,22 +171,21 @@ impl Display for ApiError {
                 request_id,
                 body,
                 ..
-            } => match (error_type, message) {
-                (Some(error_type), Some(message)) => {
+            } => {
+                if let (Some(error_type), Some(message)) = (error_type, message) {
                     write!(f, "api returned {status} ({error_type})")?;
                     if let Some(request_id) = request_id {
                         write!(f, " [trace {request_id}]")?;
                     }
                     write!(f, ": {message}")
-                }
-                _ => {
+                } else {
                     write!(f, "api returned {status}")?;
                     if let Some(request_id) = request_id {
                         write!(f, " [trace {request_id}]")?;
                     }
                     write!(f, ": {body}")
                 }
-            },
+            }
             Self::RetriesExhausted {
                 attempts,
                 last_error,
@@ -280,7 +277,7 @@ mod tests {
         };
 
         assert!(error.is_generic_fatal_wrapper());
-        assert_eq!(error.safe_failure_class(), "provider_internal");
+        assert_eq!(error.safe_failure_class(), "provider_retry_exhausted");
         assert_eq!(error.request_id(), Some("req_nested_456"));
     }
 }
