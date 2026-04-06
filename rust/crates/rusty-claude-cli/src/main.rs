@@ -151,7 +151,7 @@ fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
     } else {
-        64_000
+        32_000
     }
 }
 // Build-time constants injected by build.rs (fall back to static values when
@@ -457,6 +457,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
         )?,
+        CliAction::Solve {
+            problem_file,
+            problem,
+            model,
+            max_iterations,
+            output_file,
+            session_dir,
+        } => solve_problem(problem_file, &problem, model, max_iterations, output_file, session_dir)?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -558,6 +566,14 @@ enum CliAction {
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
+    },
+    Solve {
+        problem_file: Option<PathBuf>,
+        problem: String,
+        model: String,
+        max_iterations: usize,
+        output_file: Option<PathBuf>,
+        session_dir: Option<PathBuf>,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -939,6 +955,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }),
             }
         }
+        "solve" => parse_solve_args(&rest[1..], model),
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
@@ -2477,6 +2494,204 @@ fn looks_like_slash_command_token(token: &str) -> bool {
     slash_command_specs()
         .iter()
         .any(|spec| spec.name == name || spec.aliases.contains(&name))
+}
+
+fn parse_solve_args(args: &[String], model: String) -> Result<CliAction, String> {
+    let mut problem_file = None;
+    let mut max_iterations = 100;
+    let mut output_file = None;
+    let mut session_dir = None;
+    let mut remaining = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--problem-file" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --problem-file".to_string())?;
+                problem_file = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--max-iterations" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --max-iterations".to_string())?;
+                max_iterations = value
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid --max-iterations value: {error}"))?;
+                index += 2;
+            }
+            "--output-file" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --output-file".to_string())?;
+                output_file = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--session-dir" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --session-dir".to_string())?;
+                session_dir = Some(PathBuf::from(value));
+                index += 2;
+            }
+            other => {
+                remaining.push(other.to_string());
+                index += 1;
+            }
+        }
+    }
+
+    let problem = remaining.join(" ");
+    Ok(CliAction::Solve {
+        problem_file,
+        problem,
+        model,
+        max_iterations,
+        output_file,
+        session_dir,
+    })
+}
+
+fn solve_problem(
+    problem_file: Option<PathBuf>,
+    problem: &str,
+    model: String,
+    max_iterations: usize,
+    output_file: Option<PathBuf>,
+    session_dir: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let problem_text = if let Some(ref path) = problem_file {
+        fs::read_to_string(path)?
+    } else {
+        problem.to_string()
+    };
+
+    if problem_text.trim().is_empty() {
+        return Err("solve requires a non-empty problem statement".into());
+    }
+
+    eprintln!("[solve] Starting solve mode with max_iterations={max_iterations}");
+    eprintln!("[solve] Problem length: {} chars", problem_text.len());
+
+    let system_prompt = build_system_prompt()?;
+    let session_id = format!(
+        "solve-{}",
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    );
+    let session_handle = create_managed_session_handle(&session_id)?;
+
+    let mut built = build_runtime(
+        Session::new().with_persistence_path(session_handle.path.clone()),
+        &session_handle.id,
+        model,
+        system_prompt,
+        true,
+        false, // emit_output = false for headless mode
+        None,
+        PermissionMode::DangerFullAccess,
+        None,
+    )?;
+
+    // Apply max_iterations to the underlying runtime
+    let runtime = built
+        .runtime
+        .take()
+        .expect("runtime should exist after build");
+    built.runtime = Some(runtime.with_max_iterations(max_iterations));
+
+    eprintln!("[solve] Sending problem to model...");
+
+    // Extract the runtime to run a turn directly
+    let mut runtime = built
+        .runtime
+        .take()
+        .expect("runtime should exist after build");
+    let mut permission_prompter = CliPermissionPrompter::new(PermissionMode::DangerFullAccess);
+    let result = runtime.run_turn(&problem_text, Some(&mut permission_prompter));
+
+    match &result {
+        Ok(turn) => {
+            eprintln!("[solve] Completed in {} iterations", turn.iterations);
+            eprintln!(
+                "[solve] Token usage: input={} output={}",
+                turn.usage.input_tokens, turn.usage.output_tokens
+            );
+        }
+        Err(error) => {
+            eprintln!("[solve] Error: {error}");
+        }
+    }
+
+    // Save session to managed location
+    let session = runtime.session();
+    if let Err(error) = session.save_to_path(&session_handle.path) {
+        eprintln!("[solve] Failed to save session: {error}");
+    } else {
+        eprintln!("[solve] Session saved to {}", session_handle.path.display());
+    }
+
+    // Also save session to --session-dir if specified (for persistent trajectory storage)
+    if let Some(dir) = &session_dir {
+        let _ = fs::create_dir_all(dir);
+        let session_filename = problem_file
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| format!("{}.session.json", s.to_string_lossy()))
+            .unwrap_or_else(|| {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                format!("session-{ts}.json")
+            });
+        let external_path = dir.join(&session_filename);
+        if let Err(error) = session.save_to_path(&external_path) {
+            eprintln!(
+                "[solve] Failed to save session to {}: {error}",
+                external_path.display()
+            );
+        } else {
+            eprintln!(
+                "[solve] Session trajectory saved to {}",
+                external_path.display()
+            );
+        }
+    }
+
+    eprintln!("[solve] Extracting patch via git diff...");
+    let patch_output = std::process::Command::new("git").args(["diff"]).output();
+
+    let patch = match patch_output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if !stderr.is_empty() {
+                eprintln!("[solve] git diff stderr: {stderr}");
+            }
+            stdout
+        }
+        Err(error) => {
+            eprintln!("[solve] Failed to run git diff: {error}");
+            String::new()
+        }
+    };
+
+    eprintln!("[solve] Patch size: {} bytes", patch.len());
+
+    match output_file {
+        Some(path) => {
+            fs::write(&path, &patch)?;
+            eprintln!("[solve] Patch written to {}", path.display());
+        }
+        None => {
+            print!("{patch}");
+        }
+    }
+
+    Ok(())
 }
 
 fn dump_manifests(
@@ -7427,6 +7642,7 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    thinking: Option<api::ThinkingConfig>,
 }
 
 impl AnthropicRuntimeClient {
@@ -7481,6 +7697,7 @@ impl AnthropicRuntimeClient {
                 ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
             }
         };
+        let thinking = thinking_config_from_env();
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -7492,11 +7709,39 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            thinking,
         })
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+}
+
+/// Read thinking config from CLAW_THINKING env var.
+/// Values: "adaptive", "disabled", or a number for budget_tokens (e.g. "10000").
+/// Default (unset or empty): adaptive thinking enabled.
+fn thinking_config_from_env() -> Option<api::ThinkingConfig> {
+    let value = env::var("CLAW_THINKING").unwrap_or_default();
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(api::ThinkingConfig::Adaptive);
+    }
+    match value {
+        "adaptive" => Some(api::ThinkingConfig::Adaptive),
+        "disabled" => Some(api::ThinkingConfig::Disabled),
+        budget => match budget.parse::<u32>() {
+            Ok(tokens) => Some(api::ThinkingConfig::Enabled {
+                budget_tokens: tokens,
+            }),
+            Err(_) => {
+                eprintln!(
+                    "[warning] Invalid CLAW_THINKING value '{budget}'. \
+                     Use 'adaptive', 'disabled', or a number for budget_tokens."
+                );
+                Some(api::ThinkingConfig::Adaptive)
+            }
+        },
     }
 }
 
@@ -7526,6 +7771,7 @@ impl ApiClient for AnthropicRuntimeClient {
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
+            thinking: self.thinking.clone(),
             ..Default::default()
         };
 
@@ -8899,6 +9145,14 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "      Dump the latest (or named) session as markdown; writes to PATH or stdout"
+    )?;
+    writeln!(
+        out,
+        "  claw solve [--problem-file FILE] [--max-iterations N] [--output-file FILE] [--session-dir DIR] [PROBLEM...]"
+    )?;
+    writeln!(
+        out,
+        "      Run headless solve mode for evaluation"
     )?;
     writeln!(out)?;
     writeln!(out, "Flags:")?;
