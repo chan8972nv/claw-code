@@ -4,6 +4,14 @@ use runtime::{pricing_for_model, TokenUsage, UsageCostEstimate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingConfig {
+    Adaptive,
+    Enabled { budget_tokens: u32 },
+    Disabled,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MessageRequest {
     pub model: String,
@@ -41,6 +49,8 @@ pub struct MessageRequest {
     /// be overridden through this map.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_body: BTreeMap<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
 }
 
 impl MessageRequest {

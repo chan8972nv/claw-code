@@ -148,6 +148,15 @@ impl OpenAiCompatClient {
             {
                 "local-dev-token".to_string()
             }
+            // vLLM / Ollama endpoints typically don't require an API key. Use a
+            // placeholder when no key is set but a base URL was explicitly configured.
+            None if read_env_non_empty(config.base_url_env)
+                .ok()
+                .flatten()
+                .is_some() =>
+            {
+                "no-key-required".to_string()
+            }
             None => {
                 return Err(ApiError::missing_credentials(
                     config.provider_name,
@@ -1213,6 +1222,11 @@ fn build_chat_completion_request_for_base_url(
         payload["reasoning_effort"] = json!(effort);
     }
 
+    // Pass thinking config through for proxies that route to Claude (e.g. LiteLLM, NVIDIA NIM)
+    if let Some(thinking) = &request.thinking {
+        payload["thinking"] = serde_json::to_value(thinking).unwrap_or_default();
+    }
+
     for (key, value) in &request.extra_body {
         if is_protected_extra_body_key(key) {
             continue;
@@ -1721,8 +1735,10 @@ fn chat_completions_endpoint(base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     if trimmed.ends_with("/chat/completions") {
         trimmed.to_string()
-    } else {
+    } else if trimmed.ends_with("/v1") {
         format!("{trimmed}/chat/completions")
+    } else {
+        format!("{trimmed}/v1/chat/completions")
     }
 }
 
@@ -2328,6 +2344,11 @@ mod tests {
         assert_eq!(
             chat_completions_endpoint("https://api.x.ai/v1/chat/completions"),
             "https://api.x.ai/v1/chat/completions"
+        );
+        // Bare host (e.g. vLLM / Ollama) gets /v1/chat/completions appended
+        assert_eq!(
+            chat_completions_endpoint("http://localhost:11434"),
+            "http://localhost:11434/v1/chat/completions"
         );
     }
 

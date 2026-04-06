@@ -354,10 +354,6 @@ pub fn provider_diagnostics_for_model(model: &str) -> ProviderDiagnostics {
     }
 }
 
-fn looks_like_local_openai_model(model: &str) -> bool {
-    model.contains(':') || model.contains('.')
-}
-
 #[must_use]
 pub fn detect_provider_kind(model: &str) -> ProviderKind {
     // OLLAMA_HOST takes priority: if set, route all models through the local
@@ -369,12 +365,9 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if let Some(metadata) = metadata_for_model(&resolved_model) {
         return metadata.provider;
     }
-    // When OPENAI_BASE_URL is set and the unknown model name looks like a
-    // local server tag (for example `llama3.2` or `qwen2.5-coder:7b`), prefer
-    // the OpenAI-compatible endpoint over ambient Anthropic credentials.
-    if std::env::var_os("OPENAI_BASE_URL").is_some()
-        && looks_like_local_openai_model(&resolved_model)
-    {
+    // When OPENAI_BASE_URL is set and the model is unrecognized, prefer
+    // OpenAI-compat so that vLLM / Ollama / custom endpoints work.
+    if std::env::var_os("OPENAI_BASE_URL").is_some() {
         return ProviderKind::OpenAi;
     }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
@@ -615,7 +608,7 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
     let heuristic = if canonical.contains("opus") {
         32_000
     } else {
-        64_000
+        32_000
     };
 
     model_token_limit(model).map_or(heuristic, |limit| heuristic.min(limit.max_output_tokens))
@@ -1154,7 +1147,7 @@ mod tests {
     #[test]
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
-        assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+        assert_eq!(max_tokens_for_model("grok-3"), 32_000);
         assert_eq!(max_tokens_for_model("gpt-5.4"), 64_000);
     }
 
