@@ -542,7 +542,6 @@ fn get_simple_doing_tasks_section() -> String {
 
     std::iter::once("# Doing tasks".to_string())
         .chain(items)
-        .chain(std::iter::once("\n# Available tools".to_string()))
         .collect::<Vec<_>>()
         .join("\n")
 }

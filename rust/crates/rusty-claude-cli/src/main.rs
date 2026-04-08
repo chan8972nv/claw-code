@@ -149,9 +149,9 @@ impl ModelProvenance {
 
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
-        32_000
+        64_000
     } else {
-        32_000
+        64_000
     }
 }
 // Build-time constants injected by build.rs (fall back to static values when
@@ -2498,7 +2498,7 @@ fn looks_like_slash_command_token(token: &str) -> bool {
 
 fn parse_solve_args(args: &[String], model: String) -> Result<CliAction, String> {
     let mut problem_file = None;
-    let mut max_iterations = 100;
+    let mut max_iterations = 200;
     let mut output_file = None;
     let mut session_dir = None;
     let mut remaining = Vec::new();
