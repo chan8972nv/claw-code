@@ -2174,7 +2174,9 @@ fn solve_problem(
     let session_handle = create_managed_session_handle(&session_id)?;
 
     let mut built = build_runtime(
-        Session::new().with_persistence_path(session_handle.path.clone()),
+        Session::new()
+            .with_persistence_path(session_handle.path.clone())
+            .with_full_message_history(),
         &session_handle.id,
         model,
         system_prompt,
@@ -2214,6 +2216,12 @@ fn solve_problem(
             eprintln!("[solve] Error: {error}");
         }
     }
+
+    // Attach the system prompt to the session so it is persisted alongside messages
+    let system_prompt_sections = runtime.system_prompt().to_vec();
+    runtime
+        .session_mut()
+        .set_system_prompt(system_prompt_sections);
 
     // Save session to managed location
     let session = runtime.session();
