@@ -102,6 +102,13 @@ pub struct Session {
     /// Timestamp of last successful health check (ROADMAP #38)
     pub last_health_check_ms: Option<u64>,
     pub model: Option<String>,
+    /// The system prompt sections sent to the model, captured for session replay.
+    pub system_prompt: Option<Vec<String>>,
+    /// When enabled, captures every message ever pushed — even those later
+    /// removed by compaction. This gives eval pipelines the full trajectory.
+    /// `None` means full-history tracking is disabled (the default for
+    /// interactive sessions to avoid unbounded memory growth).
+    pub full_message_history: Option<Vec<ConversationMessage>>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -117,6 +124,8 @@ impl PartialEq for Session {
             && self.workspace_root == other.workspace_root
             && self.prompt_history == other.prompt_history
             && self.last_health_check_ms == other.last_health_check_ms
+            && self.system_prompt == other.system_prompt
+            && self.full_message_history == other.full_message_history
     }
 }
 
@@ -170,6 +179,8 @@ impl Session {
             prompt_history: Vec::new(),
             last_health_check_ms: None,
             model: None,
+            system_prompt: None,
+            full_message_history: None,
             persistence: None,
         }
     }
@@ -194,6 +205,28 @@ impl Session {
     #[must_use]
     pub fn workspace_root(&self) -> Option<&Path> {
         self.workspace_root.as_deref()
+    }
+
+    /// Attach the system prompt sections used for this session.
+    #[must_use]
+    pub fn with_system_prompt(mut self, sections: Vec<String>) -> Self {
+        self.system_prompt = Some(sections);
+        self
+    }
+
+    /// Set the system prompt sections after construction.
+    pub fn set_system_prompt(&mut self, sections: Vec<String>) {
+        self.system_prompt = Some(sections);
+    }
+
+    /// Enable full message history tracking. Once enabled, every message
+    /// pushed via [`push_message`] is also appended to a separate log that
+    /// is **never** truncated by compaction. Call this before the first
+    /// `push_message` to capture the complete trajectory.
+    #[must_use]
+    pub fn with_full_message_history(mut self) -> Self {
+        self.full_message_history = Some(Vec::new());
+        self
     }
 
     #[must_use]
@@ -228,6 +261,11 @@ impl Session {
 
     pub fn push_message(&mut self, message: ConversationMessage) -> Result<(), SessionError> {
         self.touch();
+        // Append to the full history log before touching the compactable
+        // `messages` vec — this ensures the record survives compaction.
+        if let Some(history) = &mut self.full_message_history {
+            history.push(message.clone());
+        }
         self.messages.push(message);
         let persist_result = {
             let message_ref = self.messages.last().ok_or_else(|| {
@@ -237,6 +275,9 @@ impl Session {
         };
         if let Err(error) = persist_result {
             self.messages.pop();
+            if let Some(history) = &mut self.full_message_history {
+                history.pop();
+            }
             return Err(error);
         }
         Ok(())
@@ -274,6 +315,8 @@ impl Session {
             prompt_history: self.prompt_history.clone(),
             last_health_check_ms: self.last_health_check_ms,
             model: self.model.clone(),
+            system_prompt: self.system_prompt.clone(),
+            full_message_history: self.full_message_history.clone(),
             persistence: None,
         }
     }
@@ -326,6 +369,23 @@ impl Session {
                         .map(SessionPromptEntry::to_jsonl_record)
                         .collect(),
                 ),
+            );
+        }
+        if let Some(sections) = &self.system_prompt {
+            object.insert(
+                "system_prompt".to_string(),
+                JsonValue::Array(
+                    sections
+                        .iter()
+                        .map(|s| JsonValue::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(history) = &self.full_message_history {
+            object.insert(
+                "full_message_history".to_string(),
+                JsonValue::Array(history.iter().map(ConversationMessage::to_json).collect()),
             );
         }
         Ok(JsonValue::Object(object))
@@ -386,6 +446,25 @@ impl Session {
             .get("model")
             .and_then(JsonValue::as_str)
             .map(String::from);
+        let system_prompt = object
+            .get("system_prompt")
+            .and_then(JsonValue::as_array)
+            .map(|sections| {
+                sections
+                    .iter()
+                    .filter_map(JsonValue::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            });
+        let full_message_history = object
+            .get("full_message_history")
+            .and_then(JsonValue::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|v| ConversationMessage::from_json(v).ok())
+                    .collect()
+            });
         Ok(Self {
             version,
             session_id,
@@ -398,6 +477,8 @@ impl Session {
             prompt_history,
             last_health_check_ms: None,
             model,
+            system_prompt,
+            full_message_history,
             persistence: None,
         })
     }
@@ -413,6 +494,8 @@ impl Session {
         let mut workspace_root = None;
         let mut model = None;
         let mut prompt_history = Vec::new();
+        let mut system_prompt: Option<Vec<String>> = None;
+        let mut full_message_history: Option<Vec<ConversationMessage>> = None;
 
         for (line_number, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
@@ -477,6 +560,29 @@ impl Session {
                         prompt_history.push(entry);
                     }
                 }
+                "system_prompt" => {
+                    if let Some(sections) = object.get("sections").and_then(JsonValue::as_array) {
+                        system_prompt = Some(
+                            sections
+                                .iter()
+                                .filter_map(JsonValue::as_str)
+                                .map(ToOwned::to_owned)
+                                .collect(),
+                        );
+                    }
+                }
+                "full_history_message" => {
+                    let message_value = object.get("message").ok_or_else(|| {
+                        SessionError::Format(format!(
+                            "JSONL record at line {} missing message",
+                            line_number + 1
+                        ))
+                    })?;
+                    let msg = ConversationMessage::from_json(message_value)?;
+                    full_message_history
+                        .get_or_insert_with(Vec::new)
+                        .push(msg);
+                }
                 other => {
                     return Err(SessionError::Format(format!(
                         "unsupported JSONL record type at line {}: {other}",
@@ -499,6 +605,8 @@ impl Session {
             prompt_history,
             last_health_check_ms: None,
             model,
+            system_prompt,
+            full_message_history,
             persistence: None,
         })
     }
@@ -520,6 +628,9 @@ impl Session {
 
     fn render_jsonl_snapshot(&self) -> Result<String, SessionError> {
         let mut lines = vec![self.meta_record()?.render()];
+        if let Some(sections) = &self.system_prompt {
+            lines.push(system_prompt_record(sections).render());
+        }
         if let Some(compaction) = &self.compaction {
             lines.push(compaction.to_jsonl_record()?.render());
         }
@@ -533,6 +644,16 @@ impl Session {
                 .iter()
                 .map(|message| message_record(message).render()),
         );
+        // Emit the uncompacted full message history after the compacted
+        // messages so that downstream consumers can reconstruct the
+        // complete trajectory while existing tooling ignores these records.
+        if let Some(history) = &self.full_message_history {
+            lines.extend(
+                history
+                    .iter()
+                    .map(|message| full_history_message_record(message).render()),
+            );
+        }
         let mut rendered = lines.join("\n");
         rendered.push('\n');
         Ok(rendered)
@@ -922,6 +1043,34 @@ impl SessionPromptEntry {
 fn message_record(message: &ConversationMessage) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert("type".to_string(), JsonValue::String("message".to_string()));
+    object.insert("message".to_string(), message.to_json());
+    JsonValue::Object(object)
+}
+
+fn system_prompt_record(sections: &[String]) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "type".to_string(),
+        JsonValue::String("system_prompt".to_string()),
+    );
+    object.insert(
+        "sections".to_string(),
+        JsonValue::Array(
+            sections
+                .iter()
+                .map(|s| JsonValue::String(s.clone()))
+                .collect(),
+        ),
+    );
+    JsonValue::Object(object)
+}
+
+fn full_history_message_record(message: &ConversationMessage) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "type".to_string(),
+        JsonValue::String("full_history_message".to_string()),
+    );
     object.insert("message".to_string(), message.to_json());
     JsonValue::Object(object)
 }

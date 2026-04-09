@@ -534,6 +534,12 @@ where
         &self.session
     }
 
+    /// Returns the system prompt sections used by this runtime.
+    #[must_use]
+    pub fn system_prompt(&self) -> &[String] {
+        &self.system_prompt
+    }
+
     pub fn api_client_mut(&mut self) -> &mut C {
         &mut self.api_client
     }
