@@ -545,10 +545,21 @@ fn get_simple_doing_tasks_section() -> String {
         "Use Skill to invoke predefined workflows (e.g., /commit, /pr) instead of manually assembling multi-step bash sequences.".to_string(),
     ]);
 
-    std::iter::once("# Doing tasks".to_string())
-        .chain(items)
-        .collect::<Vec<_>>()
-        .join("\n")
+    // Include tool descriptions and usage guidance only when CLAW_INCLUDE_TOOL_GUIDANCE=1
+    // is set. This allows ablation studies to measure the impact of tool guidance
+    // independently of other prompt changes.
+    let include_tool_guidance = std::env::var("CLAW_INCLUDE_TOOL_GUIDANCE")
+        .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
+
+    let mut sections: Vec<String> = vec!["# Doing tasks".to_string()];
+    sections.extend(items);
+    if include_tool_guidance {
+        sections.push("\n# Available tools".to_string());
+        sections.extend(tool_items);
+        sections.push("\n# Tool usage guidance".to_string());
+        sections.extend(tool_guidance);
+    }
+    sections.join("\n")
 }
 
 fn get_actions_section() -> String {
