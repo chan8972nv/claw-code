@@ -501,6 +501,11 @@ fn get_simple_doing_tasks_section() -> String {
         "If an approach fails, diagnose the failure before switching tactics.".to_string(),
         "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
         "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
+        "Before editing, trace bugs to their root cause — fix where the problem originates (utility, base class, data layer), not where the symptom appears (caller, formatter, view).".to_string(),
+        "Check how similar patterns are handled elsewhere in the codebase. If the same idiom appears in multiple places, match it exactly.".to_string(),
+        "Prefer the smallest possible fix. If you are changing more than ~15 lines, reconsider whether you are fixing the right thing.".to_string(),
+        "Never modify test files to make them match your fix. Your code change must make existing tests pass as-is.".to_string(),
+        "After making a fix, run the project's own test suite for the relevant module — not just a custom inline script.".to_string(),
     ]);
 
     let tool_items = prepend_bullets(vec![
