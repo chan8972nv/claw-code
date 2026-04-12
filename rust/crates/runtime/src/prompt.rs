@@ -467,13 +467,22 @@ fn render_config_section(config: &RuntimeConfig) -> String {
 }
 
 fn get_simple_intro_section(has_output_style: bool) -> String {
+    let use_minimax = std::env::var("CLAW_MINIMAX_IDENTITY")
+        .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let identity = if use_minimax {
+        "You are a helpful assistant. Your name is MiniMax-M2.5 and is built by MiniMax.".to_string()
+    } else {
+        format!(
+            "You are an interactive agent that helps users {}",
+            if has_output_style {
+                "according to your \"Output Style\" below, which describes how you should respond to user queries."
+            } else {
+                "with software engineering tasks."
+            }
+        )
+    };
     format!(
-        "You are an interactive agent that helps users {} Use the instructions below and the tools available to you to assist the user.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
-        if has_output_style {
-            "according to your \"Output Style\" below, which describes how you should respond to user queries."
-        } else {
-            "with software engineering tasks."
-        }
+        "{identity} Use the instructions below and the tools available to you to assist the user.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
     )
 }
 
