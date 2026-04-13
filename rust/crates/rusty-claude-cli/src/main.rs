@@ -7938,6 +7938,16 @@ fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
 }
 
 fn format_read_result(icon: &str, parsed: &serde_json::Value) -> String {
+    // Tool results are now plain text with a header line and numbered content.
+    // Fall back to old JSON format if present for backwards compatibility.
+    if let Some(text) = parsed.as_str() {
+        let first_line = text.lines().next().unwrap_or("read_file");
+        let body = text.lines().skip(1).collect::<Vec<_>>().join("\n");
+        return format!(
+            "{icon} \x1b[2m📄 {first_line}\x1b[0m\n{}",
+            truncate_output_for_display(&body, READ_DISPLAY_MAX_LINES, READ_DISPLAY_MAX_CHARS)
+        );
+    }
     let file = parsed.get("file").unwrap_or(parsed);
     let path = extract_tool_path(file);
     let start_line = file
@@ -7968,6 +7978,10 @@ fn format_read_result(icon: &str, parsed: &serde_json::Value) -> String {
 }
 
 fn format_write_result(icon: &str, parsed: &serde_json::Value) -> String {
+    // Tool results are now plain text like "File created successfully (N lines)."
+    if let Some(text) = parsed.as_str() {
+        return format!("{icon} \x1b[1;32m✏️ {text}\x1b[0m");
+    }
     let path = extract_tool_path(parsed);
     let kind = parsed
         .get("type")
@@ -8004,6 +8018,29 @@ fn format_structured_patch_preview(parsed: &serde_json::Value) -> Option<String>
 }
 
 fn format_edit_result(icon: &str, parsed: &serde_json::Value) -> String {
+    // Tool results are now plain text with a header line and diff.
+    if let Some(text) = parsed.as_str() {
+        let first_line = text.lines().next().unwrap_or("edit_file");
+        let diff_body = text.lines().skip(1).collect::<Vec<_>>().join("\n");
+        let colored_diff = diff_body
+            .lines()
+            .map(|line| {
+                if line.starts_with('+') {
+                    format!("\x1b[38;5;70m{line}\x1b[0m")
+                } else if line.starts_with('-') {
+                    format!("\x1b[38;5;203m{line}\x1b[0m")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return if colored_diff.trim().is_empty() {
+            format!("{icon} \x1b[1;33m📝 {first_line}\x1b[0m")
+        } else {
+            format!("{icon} \x1b[1;33m📝 {first_line}\x1b[0m\n{colored_diff}")
+        };
+    }
     let path = extract_tool_path(parsed);
     let suffix = if parsed
         .get("replaceAll")
@@ -8033,6 +8070,16 @@ fn format_edit_result(icon: &str, parsed: &serde_json::Value) -> String {
 }
 
 fn format_glob_result(icon: &str, parsed: &serde_json::Value) -> String {
+    // Tool results are now plain text like "Found N files\n\npath1\npath2..."
+    if let Some(text) = parsed.as_str() {
+        let first_line = text.lines().next().unwrap_or("glob_search");
+        let files = text.lines().skip(2).take(8).collect::<Vec<_>>().join("\n");
+        return if files.is_empty() {
+            format!("{icon} \x1b[38;5;245mglob_search\x1b[0m {first_line}")
+        } else {
+            format!("{icon} \x1b[38;5;245mglob_search\x1b[0m {first_line}\n{files}")
+        };
+    }
     let num_files = parsed
         .get("numFiles")
         .and_then(serde_json::Value::as_u64)
@@ -8057,6 +8104,24 @@ fn format_glob_result(icon: &str, parsed: &serde_json::Value) -> String {
 }
 
 fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
+    // Tool results are now plain text like "Found N matches in M files\n\ncontent..."
+    if let Some(text) = parsed.as_str() {
+        let first_line = text.lines().next().unwrap_or("grep_search");
+        let body = text.lines().skip(2).collect::<Vec<_>>().join("\n");
+        let summary = format!("{icon} \x1b[38;5;245mgrep_search\x1b[0m {first_line}");
+        return if body.trim().is_empty() {
+            summary
+        } else {
+            format!(
+                "{summary}\n{}",
+                truncate_output_for_display(
+                    &body,
+                    TOOL_OUTPUT_DISPLAY_MAX_LINES,
+                    TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+                )
+            )
+        };
+    }
     let num_matches = parsed
         .get("numMatches")
         .and_then(serde_json::Value::as_u64)

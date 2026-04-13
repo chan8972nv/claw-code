@@ -616,40 +616,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::WorkspaceWrite,
         },
-        ToolSpec {
-            name: "Sleep",
-            description: "Wait for a specified duration without holding a shell process.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "duration_ms": { "type": "integer", "minimum": 0 }
-                },
-                "required": ["duration_ms"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "SendUserMessage",
-            description: "Send a message to the user.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "message": { "type": "string" },
-                    "attachments": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": ["normal", "proactive"]
-                    }
-                },
-                "required": ["message", "status"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
+        // NOTE: Sleep and SendUserMessage tools removed to reduce tool bloat.
+        // They were rarely used in SWE-bench evaluations and wasted context tokens.
         ToolSpec {
             name: "Config",
             description: "Get or set Claude Code settings.",
@@ -695,37 +663,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::ReadOnly,
         },
-        ToolSpec {
-            name: "REPL",
-            description: "Execute code in a REPL-like subprocess.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "code": { "type": "string" },
-                    "language": { "type": "string" },
-                    "timeout_ms": { "type": "integer", "minimum": 1 }
-                },
-                "required": ["code", "language"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "PowerShell",
-            description: "Execute a PowerShell command with optional timeout.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
-                    "description": { "type": "string" },
-                    "run_in_background": { "type": "boolean" }
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
+        // NOTE: REPL and PowerShell tools removed to reduce tool bloat.
+        // REPL calls mostly failed in SWE-bench (missing packages); use `python -c` via bash instead.
+        // PowerShell never works on Linux SWE-bench environments.
         ToolSpec {
             name: "AskUserQuestion",
             description: "Ask the user a question and wait for their response.",
@@ -839,19 +779,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
-        ToolSpec {
-            name: "TaskOutput",
-            description: "Retrieve the output produced by a background task.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string" }
-                },
-                "required": ["task_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
+        // NOTE: TaskOutput tool removed — always failed with "task not found" in SWE-bench.
         ToolSpec {
             name: "WorkerCreate",
             description: "Create a coding worker boot session with trust-gate and prompt-delivery guards.",
@@ -1068,23 +996,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::ReadOnly,
         },
-        ToolSpec {
-            name: "LSP",
-            description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["symbols", "references", "diagnostics", "definition", "hover"] },
-                    "path": { "type": "string" },
-                    "line": { "type": "integer", "minimum": 0 },
-                    "character": { "type": "integer", "minimum": 0 },
-                    "query": { "type": "string" }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
+        // NOTE: LSP tool removed — no LSP server available in SWE-bench environments.
         ToolSpec {
             name: "ListMcpResources",
             description: "List available resources from connected MCP servers.",
@@ -1230,22 +1142,14 @@ fn execute_tool_with_enforcer(
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
         "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
-        "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
-        "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
+        // Sleep and SendUserMessage removed (tool bloat reduction)
         "Config" => from_value::<ConfigInput>(input).and_then(run_config),
         "EnterPlanMode" => from_value::<EnterPlanModeInput>(input).and_then(run_enter_plan_mode),
         "ExitPlanMode" => from_value::<ExitPlanModeInput>(input).and_then(run_exit_plan_mode),
         "StructuredOutput" => {
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
-        "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
-        "PowerShell" => {
-            // Parse input to get the command for permission classification
-            let ps_input: PowerShellInput = from_value(input)?;
-            let classified_mode = classify_powershell_permission(&ps_input.command);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
-            run_powershell(ps_input)
-        }
+        // REPL and PowerShell removed (tool bloat reduction)
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
         }
@@ -1255,7 +1159,7 @@ fn execute_tool_with_enforcer(
         "TaskList" => run_task_list(input.clone()),
         "TaskStop" => from_value::<TaskIdInput>(input).and_then(run_task_stop),
         "TaskUpdate" => from_value::<TaskUpdateInput>(input).and_then(run_task_update),
-        "TaskOutput" => from_value::<TaskIdInput>(input).and_then(run_task_output),
+        // TaskOutput removed (tool bloat reduction)
         "WorkerCreate" => from_value::<WorkerCreateInput>(input).and_then(run_worker_create),
         "WorkerGet" => from_value::<WorkerIdInput>(input).and_then(run_worker_get),
         "WorkerObserve" => from_value::<WorkerObserveInput>(input).and_then(run_worker_observe),
@@ -1275,7 +1179,7 @@ fn execute_tool_with_enforcer(
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
         "CronList" => run_cron_list(input.clone()),
-        "LSP" => from_value::<LspInput>(input).and_then(run_lsp),
+        // LSP removed (tool bloat reduction)
         "ListMcpResources" => {
             from_value::<McpResourceInput>(input).and_then(run_list_mcp_resources)
         }
@@ -2061,35 +1965,113 @@ fn branch_divergence_output(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
+    let output = read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?;
+    // Return compact line-numbered plain text instead of verbose JSON.
+    // This saves significant tokens compared to the old JSON envelope with
+    // nested file object, reducing context window pressure.
+    let mut result = format!(
+        "{} (lines {}-{} of {})\n",
+        output.file.file_path,
+        output.file.start_line,
+        output.file.start_line + output.file.num_lines.saturating_sub(1),
+        output.file.total_lines,
+    );
+    for (i, line) in output.file.content.lines().enumerate() {
+        result.push_str(&format!(
+            "{}\t{}\n",
+            output.file.start_line + i,
+            line
+        ));
+    }
+    Ok(result)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
+    let output = write_file(&input.path, &input.content).map_err(io_to_string)?;
+    // Return a compact result instead of echoing back the full file content
+    // and original file, which wastes thousands of tokens.
+    Ok(format!(
+        "File {} successfully ({} lines).",
+        if output.kind == "create" { "created" } else { "updated" },
+        output.content.lines().count()
+    ))
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
-    to_pretty_json(
-        edit_file(
-            &input.path,
-            &input.old_string,
-            &input.new_string,
-            input.replace_all.unwrap_or(false),
-        )
-        .map_err(io_to_string)?,
+    let output = edit_file(
+        &input.path,
+        &input.old_string,
+        &input.new_string,
+        input.replace_all.unwrap_or(false),
     )
+    .map_err(io_to_string)?;
+    // Return a compact result instead of the full JSON with originalFile.
+    // The old format included the entire original file content, wasting
+    // thousands of tokens per edit. Now we return just a success message
+    // plus a minimal diff showing what changed.
+    let mut result = format!("Edit applied successfully to {}.\n", output.file_path);
+    for hunk in &output.structured_patch {
+        result.push_str(&format!(
+            "\n@@ -{},{} +{},{} @@\n",
+            hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
+        ));
+        for line in &hunk.lines {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    Ok(result)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
-    to_pretty_json(glob_search(&input.pattern, input.path.as_deref()).map_err(io_to_string)?)
+    let output = glob_search(&input.pattern, input.path.as_deref()).map_err(io_to_string)?;
+    // Return compact plain text instead of JSON with metadata.
+    let mut result = format!("Found {} files", output.num_files);
+    if output.truncated {
+        result.push_str(" (truncated)");
+    }
+    result.push_str("\n\n");
+    result.push_str(&output.filenames.join("\n"));
+    Ok(result)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
-    to_pretty_json(grep_search(&input).map_err(io_to_string)?)
+    let output = grep_search(&input).map_err(io_to_string)?;
+    // Return compact plain text instead of verbose JSON envelope.
+    // This reduces token overhead from metadata fields (mode, numFiles,
+    // appliedLimit, appliedOffset) that the model rarely uses.
+    let mode = output.mode.as_deref().unwrap_or("files_with_matches");
+    match mode {
+        "content" => {
+            let content = output.content.unwrap_or_default();
+            let header = format!(
+                "Found {} matches in {} files\n\n",
+                output.num_lines.unwrap_or(0),
+                output.num_files
+            );
+            Ok(format!("{}{}", header, content))
+        }
+        "count" => {
+            Ok(format!(
+                "Found {} matches in {} files\n\n{}",
+                output.num_matches.unwrap_or(0),
+                output.num_files,
+                output.filenames.join("\n")
+            ))
+        }
+        _ => {
+            // files_with_matches
+            Ok(format!(
+                "Found {} files\n\n{}",
+                output.num_files,
+                output.filenames.join("\n")
+            ))
+        }
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -3661,7 +3643,6 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "Skill",
             "TodoWrite",
             "StructuredOutput",
-            "SendUserMessage",
         ],
         "Verification" => vec![
             "bash",
@@ -3673,8 +3654,6 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "ToolSearch",
             "TodoWrite",
             "StructuredOutput",
-            "SendUserMessage",
-            "PowerShell",
         ],
         "claw-guide" => vec![
             "read_file",
@@ -3685,7 +3664,6 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "ToolSearch",
             "Skill",
             "StructuredOutput",
-            "SendUserMessage",
         ],
         "statusline-setup" => vec![
             "bash",
@@ -3709,12 +3687,8 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "Skill",
             "ToolSearch",
             "NotebookEdit",
-            "Sleep",
-            "SendUserMessage",
             "Config",
             "StructuredOutput",
-            "REPL",
-            "PowerShell",
         ],
     };
     tools.into_iter().map(str::to_string).collect()
@@ -6225,14 +6199,15 @@ mod tests {
         assert!(names.contains(&"Agent"));
         assert!(names.contains(&"ToolSearch"));
         assert!(names.contains(&"NotebookEdit"));
-        assert!(names.contains(&"Sleep"));
-        assert!(names.contains(&"SendUserMessage"));
+        // Sleep, SendUserMessage, REPL, PowerShell removed (tool bloat reduction)
+        assert!(!names.contains(&"Sleep"));
+        assert!(!names.contains(&"SendUserMessage"));
+        assert!(!names.contains(&"REPL"));
+        assert!(!names.contains(&"PowerShell"));
         assert!(names.contains(&"Config"));
         assert!(names.contains(&"EnterPlanMode"));
         assert!(names.contains(&"ExitPlanMode"));
         assert!(names.contains(&"StructuredOutput"));
-        assert!(names.contains(&"REPL"));
-        assert!(names.contains(&"PowerShell"));
         assert!(names.contains(&"WorkerCreate"));
         assert!(names.contains(&"WorkerObserve"));
         assert!(names.contains(&"WorkerAwaitReady"));
@@ -8383,7 +8358,7 @@ mod tests {
 
         let verification = allowed_tools_for_subagent("Verification");
         assert!(verification.contains("bash"));
-        assert!(verification.contains("PowerShell"));
+        assert!(!verification.contains("PowerShell")); // PowerShell removed
         assert!(!verification.contains("write_file"));
     }
 
@@ -8739,14 +8714,13 @@ mod tests {
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&root).expect("set cwd");
 
+        // write_file, read_file, edit_file now return compact plain-text results
         let write_create = execute_tool(
             "write_file",
             &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
         )
         .expect("write create should succeed");
-        let write_create_output: serde_json::Value =
-            serde_json::from_str(&write_create).expect("json");
-        assert_eq!(write_create_output["type"], "create");
+        assert!(write_create.contains("created"));
         assert!(root.join("nested/demo.txt").exists());
 
         let write_update = execute_tool(
@@ -8754,35 +8728,30 @@ mod tests {
             &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\ngamma\n" }),
         )
         .expect("write update should succeed");
-        let write_update_output: serde_json::Value =
-            serde_json::from_str(&write_update).expect("json");
-        assert_eq!(write_update_output["type"], "update");
-        assert_eq!(write_update_output["originalFile"], "alpha\nbeta\nalpha\n");
+        assert!(write_update.contains("updated"));
 
         let read_full = execute_tool("read_file", &json!({ "path": "nested/demo.txt" }))
             .expect("read full should succeed");
-        let read_full_output: serde_json::Value = serde_json::from_str(&read_full).expect("json");
-        assert_eq!(read_full_output["file"]["content"], "alpha\nbeta\ngamma");
-        assert_eq!(read_full_output["file"]["startLine"], 1);
+        // Plain-text format: header line then numbered lines
+        assert!(read_full.contains("alpha"));
+        assert!(read_full.contains("beta"));
+        assert!(read_full.contains("gamma"));
+        assert!(read_full.contains("1\t"));
 
         let read_slice = execute_tool(
             "read_file",
             &json!({ "path": "nested/demo.txt", "offset": 1, "limit": 1 }),
         )
         .expect("read slice should succeed");
-        let read_slice_output: serde_json::Value = serde_json::from_str(&read_slice).expect("json");
-        assert_eq!(read_slice_output["file"]["content"], "beta");
-        assert_eq!(read_slice_output["file"]["startLine"], 2);
+        assert!(read_slice.contains("beta"));
+        assert!(read_slice.contains("lines 2-2"));
 
         let read_past_end = execute_tool(
             "read_file",
             &json!({ "path": "nested/demo.txt", "offset": 50 }),
         )
         .expect("read past EOF should succeed");
-        let read_past_end_output: serde_json::Value =
-            serde_json::from_str(&read_past_end).expect("json");
-        assert_eq!(read_past_end_output["file"]["content"], "");
-        assert_eq!(read_past_end_output["file"]["startLine"], 4);
+        assert!(read_past_end.contains("lines 4-"));
 
         let read_error = execute_tool("read_file", &json!({ "path": "missing.txt" }))
             .expect_err("missing file should fail");
@@ -8793,8 +8762,7 @@ mod tests {
             &json!({ "path": "nested/demo.txt", "old_string": "alpha", "new_string": "omega" }),
         )
         .expect("single edit should succeed");
-        let edit_once_output: serde_json::Value = serde_json::from_str(&edit_once).expect("json");
-        assert_eq!(edit_once_output["replaceAll"], false);
+        assert!(edit_once.contains("Edit applied successfully"));
         assert_eq!(
             fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
             "omega\nbeta\ngamma\n"
@@ -8815,8 +8783,7 @@ mod tests {
             }),
         )
         .expect("replace all should succeed");
-        let edit_all_output: serde_json::Value = serde_json::from_str(&edit_all).expect("json");
-        assert_eq!(edit_all_output["replaceAll"], true);
+        assert!(edit_all.contains("Edit applied successfully"));
         assert_eq!(
             fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
             "omega\nbeta\nomega\n"
@@ -8857,14 +8824,11 @@ mod tests {
         .expect("write rust file");
         fs::write(root.join("nested/notes.txt"), "alpha\nbeta\n").expect("write txt file");
 
+        // glob_search and grep_search now return compact plain-text results
         let globbed = execute_tool("glob_search", &json!({ "pattern": "nested/*.rs" }))
             .expect("glob should succeed");
-        let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
-        assert_eq!(globbed_output["numFiles"], 1);
-        assert!(globbed_output["filenames"][0]
-            .as_str()
-            .expect("filename")
-            .ends_with("nested/lib.rs"));
+        assert!(globbed.contains("Found 1 files"));
+        assert!(globbed.contains("nested/lib.rs"));
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
@@ -8883,23 +8847,15 @@ mod tests {
             }),
         )
         .expect("grep content should succeed");
-        let grep_content_output: serde_json::Value =
-            serde_json::from_str(&grep_content).expect("json");
-        assert_eq!(grep_content_output["numFiles"], 0);
-        assert!(grep_content_output["appliedLimit"].is_null());
-        assert_eq!(grep_content_output["appliedOffset"], 1);
-        assert!(grep_content_output["content"]
-            .as_str()
-            .expect("content")
-            .contains("let alpha = 2;"));
+        assert!(grep_content.contains("Found"));
+        assert!(grep_content.contains("let alpha = 2;"));
 
         let grep_count = execute_tool(
             "grep_search",
             &json!({ "pattern": "alpha", "path": "nested", "output_mode": "count" }),
         )
         .expect("grep count should succeed");
-        let grep_count_output: serde_json::Value = serde_json::from_str(&grep_count).expect("json");
-        assert_eq!(grep_count_output["numMatches"], 3);
+        assert!(grep_count.contains("Found 3 matches"));
 
         let grep_error = execute_tool(
             "grep_search",
@@ -8912,63 +8868,9 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn sleep_waits_and_reports_duration() {
-        let started = std::time::Instant::now();
-        let result =
-            execute_tool("Sleep", &json!({"duration_ms": 20})).expect("Sleep should succeed");
-        let elapsed = started.elapsed();
-        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["duration_ms"], 20);
-        assert!(output["message"]
-            .as_str()
-            .expect("message")
-            .contains("Slept for 20ms"));
-        assert!(elapsed >= Duration::from_millis(15));
-    }
+    // Sleep tests removed — tool removed for SWE-bench bloat reduction.
 
-    #[test]
-    fn given_excessive_duration_when_sleep_then_rejects_with_error() {
-        let result = execute_tool("Sleep", &json!({"duration_ms": 999_999_999_u64}));
-        let error = result.expect_err("excessive sleep should fail");
-        assert!(error.contains("exceeds maximum allowed sleep"));
-    }
-
-    #[test]
-    fn given_zero_duration_when_sleep_then_succeeds() {
-        let result =
-            execute_tool("Sleep", &json!({"duration_ms": 0})).expect("0ms sleep should succeed");
-        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["duration_ms"], 0);
-    }
-
-    #[test]
-    fn brief_returns_sent_message_and_attachment_metadata() {
-        let attachment = std::env::temp_dir().join(format!(
-            "clawd-brief-{}.png",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        std::fs::write(&attachment, b"png-data").expect("write attachment");
-
-        let result = execute_tool(
-            "SendUserMessage",
-            &json!({
-                "message": "hello user",
-                "attachments": [attachment.display().to_string()],
-                "status": "normal"
-            }),
-        )
-        .expect("SendUserMessage should succeed");
-
-        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["message"], "hello user");
-        assert!(output["sentAt"].as_str().is_some());
-        assert_eq!(output["attachments"][0]["isImage"], true);
-        let _ = std::fs::remove_file(attachment);
-    }
+    // SendUserMessage/Brief test removed — tool removed for SWE-bench bloat reduction.
 
     #[test]
     fn config_reads_and_writes_supported_values() {
@@ -9187,130 +9089,9 @@ mod tests {
         assert!(error.contains("must not be empty"));
     }
 
-    #[test]
-    fn repl_executes_python_code() {
-        let result = execute_tool(
-            "REPL",
-            &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),
-        )
-        .expect("REPL should succeed");
-        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["language"], "python");
-        assert_eq!(output["exitCode"], 0);
-        assert!(output["stdout"].as_str().expect("stdout").contains('2'));
-    }
+    // REPL tests removed — tool removed for SWE-bench bloat reduction.
 
-    #[test]
-    fn given_empty_code_when_repl_then_rejects_with_error() {
-        let result = execute_tool("REPL", &json!({"language": "python", "code": "   "}));
-
-        let error = result.expect_err("empty REPL code should fail");
-        assert!(error.contains("code must not be empty"));
-    }
-
-    #[test]
-    fn given_unsupported_language_when_repl_then_rejects_with_error() {
-        let result = execute_tool("REPL", &json!({"language": "ruby", "code": "puts 1"}));
-
-        let error = result.expect_err("unsupported REPL language should fail");
-        assert!(error.contains("unsupported REPL language: ruby"));
-    }
-
-    #[test]
-    fn given_timeout_ms_when_repl_blocks_then_returns_timeout_error() {
-        let result = execute_tool(
-            "REPL",
-            &json!({
-                "language": "python",
-                "code": "import time\ntime.sleep(1)",
-                "timeout_ms": 10
-            }),
-        );
-
-        let error = result.expect_err("timed out REPL execution should fail");
-        assert!(error.contains("REPL execution exceeded timeout of 10 ms"));
-    }
-
-    #[test]
-    fn powershell_runs_via_stub_shell() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = std::env::temp_dir().join(format!(
-            "clawd-pwsh-bin-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("create dir");
-        let script = dir.join("pwsh");
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
-while [ "$1" != "-Command" ] && [ $# -gt 0 ]; do shift; done
-shift
-printf 'pwsh:%s' "$1"
-"#,
-        )
-        .expect("write script");
-        std::process::Command::new("/bin/chmod")
-            .arg("+x")
-            .arg(&script)
-            .status()
-            .expect("chmod");
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
-
-        let result = execute_tool(
-            "PowerShell",
-            &json!({"command": "Write-Output hello", "timeout": 1000}),
-        )
-        .expect("PowerShell should succeed");
-
-        let background = execute_tool(
-            "PowerShell",
-            &json!({"command": "Write-Output hello", "run_in_background": true}),
-        )
-        .expect("PowerShell background should succeed");
-
-        std::env::set_var("PATH", original_path);
-        let _ = std::fs::remove_dir_all(dir);
-
-        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["stdout"], "pwsh:Write-Output hello");
-        assert!(output["stderr"].as_str().expect("stderr").is_empty());
-
-        let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
-        assert!(background_output["backgroundTaskId"].as_str().is_some());
-        assert_eq!(background_output["backgroundedByUser"], true);
-        assert_eq!(background_output["assistantAutoBackgrounded"], false);
-    }
-
-    #[test]
-    fn powershell_errors_when_shell_is_missing() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        let empty_dir = std::env::temp_dir().join(format!(
-            "clawd-empty-bin-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&empty_dir).expect("create empty dir");
-        std::env::set_var("PATH", empty_dir.display().to_string());
-
-        let err = execute_tool("PowerShell", &json!({"command": "Write-Output hello"}))
-            .expect_err("PowerShell should fail when shell is missing");
-
-        std::env::set_var("PATH", original_path);
-        let _ = std::fs::remove_dir_all(empty_dir);
-
-        assert!(err.contains("PowerShell executable not found"));
-    }
+    // PowerShell tests removed — tool removed for SWE-bench bloat reduction.
 
     fn read_only_registry() -> super::GlobalToolRegistry {
         use runtime::permission_enforcer::PermissionEnforcer;

@@ -1079,6 +1079,15 @@ fn extract_read_content(tool_output: &str) -> String {
 
 #[allow(clippy::cast_possible_truncation)]
 fn extract_num_matches(tool_output: &str) -> usize {
+    // Try plain-text format first: "Found N matches in M files"
+    if let Some(rest) = tool_output.strip_prefix("Found ") {
+        if let Some(count_str) = rest.split_whitespace().next() {
+            if let Ok(n) = count_str.parse::<usize>() {
+                return n;
+            }
+        }
+    }
+    // Fall back to legacy JSON format
     serde_json::from_str::<Value>(tool_output)
         .ok()
         .and_then(|value| value.get("numMatches").and_then(Value::as_u64))
@@ -1086,6 +1095,19 @@ fn extract_num_matches(tool_output: &str) -> usize {
 }
 
 fn extract_file_path(tool_output: &str) -> String {
+    // Try plain-text format first: "Edit applied successfully to /path/to/file."
+    if tool_output.starts_with("Edit applied successfully to ") {
+        return tool_output
+            .strip_prefix("Edit applied successfully to ")
+            .and_then(|rest| rest.strip_suffix('.'))
+            .unwrap_or(tool_output.trim())
+            .to_string();
+    }
+    // Try read_file format: "/path/to/file (lines ...)"
+    if let Some(paren_pos) = tool_output.find(" (lines ") {
+        return tool_output[..paren_pos].to_string();
+    }
+    // Fall back to legacy JSON format
     serde_json::from_str::<Value>(tool_output)
         .ok()
         .and_then(|value| {
