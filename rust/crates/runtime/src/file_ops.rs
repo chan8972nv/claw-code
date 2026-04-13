@@ -515,22 +515,245 @@ fn apply_limit<T>(
     )
 }
 
+/// Number of unchanged context lines shown around each change in the diff.
+const DIFF_CONTEXT_LINES: usize = 3;
+
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
-    let mut lines = Vec::new();
-    for line in original.lines() {
-        lines.push(format!("-{line}"));
+    let old_lines: Vec<&str> = original.lines().collect();
+    let new_lines: Vec<&str> = updated.lines().collect();
+
+    // Simple LCS-based diff: find longest common subsequence, then emit hunks.
+    let lcs = lcs_diff(&old_lines, &new_lines);
+
+    // Collect raw edit operations: Equal, Remove, Add
+    let mut ops: Vec<DiffOp> = Vec::new();
+    let (mut oi, mut ni) = (0usize, 0usize);
+    for &(lo, ln) in &lcs {
+        while oi < lo {
+            ops.push(DiffOp::Remove(oi));
+            oi += 1;
+        }
+        while ni < ln {
+            ops.push(DiffOp::Add(ni));
+            ni += 1;
+        }
+        ops.push(DiffOp::Equal(oi, ni));
+        oi += 1;
+        ni += 1;
     }
-    for line in updated.lines() {
-        lines.push(format!("+{line}"));
+    while oi < old_lines.len() {
+        ops.push(DiffOp::Remove(oi));
+        oi += 1;
+    }
+    while ni < new_lines.len() {
+        ops.push(DiffOp::Add(ni));
+        ni += 1;
     }
 
-    vec![StructuredPatchHunk {
-        old_start: 1,
-        old_lines: original.lines().count(),
-        new_start: 1,
-        new_lines: updated.lines().count(),
-        lines,
-    }]
+    // Group ops into hunks with DIFF_CONTEXT_LINES of surrounding context.
+    let mut hunks = Vec::new();
+    let mut idx = 0;
+    while idx < ops.len() {
+        // Skip equal lines that are far from changes.
+        if matches!(ops[idx], DiffOp::Equal(..)) {
+            idx += 1;
+            continue;
+        }
+        // Found a change — walk backwards for leading context.
+        let ctx = DIFF_CONTEXT_LINES;
+        let mut start = idx;
+        let mut leading = 0;
+        while leading < ctx && start > 0 {
+            if matches!(ops[start - 1], DiffOp::Equal(..)) {
+                start -= 1;
+                leading += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Walk forward past changes and trailing context, merging nearby hunks.
+        let mut end = idx;
+        let mut trailing_equal = 0;
+        while end < ops.len() {
+            match ops[end] {
+                DiffOp::Equal(..) => {
+                    trailing_equal += 1;
+                    if trailing_equal > ctx * 2 {
+                        // Too much gap — end this hunk after ctx trailing lines.
+                        end = end - trailing_equal + ctx;
+                        break;
+                    }
+                    end += 1;
+                }
+                _ => {
+                    trailing_equal = 0;
+                    end += 1;
+                }
+            }
+        }
+        // Trim trailing equals beyond context.
+        while end > start
+            && matches!(ops[end - 1], DiffOp::Equal(..))
+            && {
+                let trailing_count = ops[..end]
+                    .iter()
+                    .rev()
+                    .take_while(|op| matches!(op, DiffOp::Equal(..)))
+                    .count();
+                trailing_count > ctx
+            }
+        {
+            end -= 1;
+        }
+
+        // Build hunk from ops[start..end].
+        let mut hunk_lines = Vec::new();
+        let mut old_start = 0;
+        let mut old_count = 0;
+        let mut new_start = 0;
+        let mut new_count = 0;
+        let mut first = true;
+        for op in &ops[start..end] {
+            match *op {
+                DiffOp::Equal(o, n) => {
+                    if first {
+                        old_start = o + 1;
+                        new_start = n + 1;
+                        first = false;
+                    }
+                    hunk_lines.push(format!(" {}", old_lines[o]));
+                    old_count += 1;
+                    new_count += 1;
+                }
+                DiffOp::Remove(o) => {
+                    if first {
+                        old_start = o + 1;
+                        new_start = if o < new_lines.len() { o + 1 } else { new_lines.len() + 1 };
+                        first = false;
+                    }
+                    hunk_lines.push(format!("-{}", old_lines[o]));
+                    old_count += 1;
+                }
+                DiffOp::Add(n) => {
+                    if first {
+                        old_start = if n < old_lines.len() { n + 1 } else { old_lines.len() + 1 };
+                        new_start = n + 1;
+                        first = false;
+                    }
+                    hunk_lines.push(format!("+{}", new_lines[n]));
+                    new_count += 1;
+                }
+            }
+        }
+
+        if !hunk_lines.is_empty() {
+            hunks.push(StructuredPatchHunk {
+                old_start,
+                old_lines: old_count,
+                new_start,
+                new_lines: new_count,
+                lines: hunk_lines,
+            });
+        }
+
+        idx = end;
+    }
+
+    // Fallback: if no hunks were produced but content differs, emit a minimal hunk.
+    if hunks.is_empty() && original != updated {
+        let mut lines = Vec::new();
+        for line in old_lines.iter() {
+            lines.push(format!("-{line}"));
+        }
+        for line in new_lines.iter() {
+            lines.push(format!("+{line}"));
+        }
+        hunks.push(StructuredPatchHunk {
+            old_start: 1,
+            old_lines: old_lines.len(),
+            new_start: 1,
+            new_lines: new_lines.len(),
+            lines,
+        });
+    }
+
+    hunks
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DiffOp {
+    Equal(usize, usize), // old_idx, new_idx
+    Remove(usize),       // old_idx
+    Add(usize),          // new_idx
+}
+
+/// Compute the longest common subsequence of two line slices.
+/// Returns a list of (old_index, new_index) pairs for matching lines.
+fn lcs_diff<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<(usize, usize)> {
+    let m = old.len();
+    let n = new.len();
+
+    // For very large files, use a simplified approach to avoid O(m*n) memory.
+    if m * n > 10_000_000 {
+        return lcs_diff_simple(old, new);
+    }
+
+    // Standard DP table.
+    let mut dp = vec![vec![0u32; n + 1]; m + 1];
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            dp[i][j] = if old[i] == new[j] {
+                1 + dp[i + 1][j + 1]
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+
+    let mut result = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < m && j < n {
+        if old[i] == new[j] {
+            result.push((i, j));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    result
+}
+
+/// Simplified diff for very large files: match equal prefix, suffix, and
+/// then treat the middle as a single replacement block.
+fn lcs_diff_simple<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<(usize, usize)> {
+    let mut result = Vec::new();
+    let m = old.len();
+    let n = new.len();
+
+    // Match prefix.
+    let mut prefix = 0;
+    while prefix < m && prefix < n && old[prefix] == new[prefix] {
+        result.push((prefix, prefix));
+        prefix += 1;
+    }
+
+    // Match suffix.
+    let mut suffix = 0;
+    while suffix < m - prefix && suffix < n - prefix && old[m - 1 - suffix] == new[n - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    // Add suffix matches.
+    for s in (0..suffix).rev() {
+        result.push((m - 1 - s, n - 1 - s));
+    }
+
+    result
 }
 
 fn normalize_path(path: &str) -> io::Result<PathBuf> {
