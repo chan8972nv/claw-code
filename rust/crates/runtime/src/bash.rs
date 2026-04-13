@@ -176,14 +176,26 @@ async fn execute_bash_async(
 
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
 
-    let output_result = if let Some(timeout_ms) = input.timeout {
-        if let Ok(result) = timeout(Duration::from_millis(timeout_ms), command.output()).await {
-            (result?, false)
-        } else {
-            return Ok(timeout_output(&input, timeout_ms, sandbox_status));
+    // Models typically specify timeout in seconds (e.g. 120 for 2 minutes),
+    // but Duration::from_millis expects milliseconds. Heuristic: if the value
+    // is <= 1000 it was almost certainly meant as seconds — convert to ms.
+    // Default to 1_200_000 ms (20 minutes) when no timeout is given so that
+    // long-running test suites don't hang forever.
+    let effective_timeout_ms = match input.timeout {
+        Some(v) if v <= 1000 => v * 1000,
+        Some(v) => v,
+        None => 1_200_000,
+    };
+    let output_result = match timeout(
+        Duration::from_millis(effective_timeout_ms),
+        command.output(),
+    )
+    .await
+    {
+        Ok(result) => (result?, false),
+        Err(_) => {
+            return Ok(timeout_output(&input, effective_timeout_ms, sandbox_status));
         }
-    } else {
-        (command.output().await?, false)
     };
 
     let (output, interrupted) = output_result;
