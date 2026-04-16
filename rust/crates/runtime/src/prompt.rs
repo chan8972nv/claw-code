@@ -201,6 +201,21 @@ pub fn prepend_bullets(items: Vec<String>) -> Vec<String> {
 }
 
 fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
+    let mut files = Vec::new();
+
+    // Honour CLAW_INSTRUCTION_FILES: a colon-separated list of explicit paths.
+    // This is the primary injection point for eval harnesses where the container
+    // workdir is unrelated to the repo that owns the CLAUDE.md.
+    if let Ok(extra) = std::env::var("CLAW_INSTRUCTION_FILES") {
+        for raw in extra.split(':') {
+            let path = raw.trim();
+            if !path.is_empty() {
+                push_context_file(&mut files, PathBuf::from(path))?;
+            }
+        }
+    }
+
+    // Walk ancestor directories from root → cwd looking for instruction files.
     let mut directories = Vec::new();
     let mut cursor = Some(cwd);
     while let Some(dir) = cursor {
@@ -209,7 +224,6 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
     }
     directories.reverse();
 
-    let mut files = Vec::new();
     for dir in directories {
         for candidate in [
             dir.join("CLAUDE.md"),
@@ -654,6 +668,51 @@ mod tests {
             ]
         );
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn env_var_injects_instruction_files_before_ancestor_walk() {
+        let root = temp_dir();
+        let extra_dir = temp_dir();
+        let cwd = root.join("work");
+        fs::create_dir_all(&cwd).expect("cwd dir");
+
+        // Instruction file outside the ancestor chain of cwd.
+        fs::write(extra_dir.join("CLAUDE.md"), "injected instructions")
+            .expect("write injected CLAUDE.md");
+        // Instruction file inside the ancestor chain.
+        fs::write(root.join("CLAUDE.md"), "ancestor instructions")
+            .expect("write ancestor CLAUDE.md");
+
+        let env_val = extra_dir.join("CLAUDE.md").display().to_string();
+        // Safety: this test is single-threaded via the serial attribute pattern
+        // used by other tests in this module. Setting env vars is safe here.
+        unsafe { std::env::set_var("CLAW_INSTRUCTION_FILES", &env_val) };
+
+        let context = ProjectContext::discover(&cwd, "2026-04-15").expect("context should load");
+        let contents: Vec<&str> = context
+            .instruction_files
+            .iter()
+            .map(|f| f.content.as_str())
+            .collect();
+
+        // Env-var files come first, then ancestor-walk files.
+        assert!(
+            contents.contains(&"injected instructions"),
+            "env-var instruction file must be included"
+        );
+        assert!(
+            contents.contains(&"ancestor instructions"),
+            "ancestor-walk instruction file must still be included"
+        );
+        assert_eq!(
+            contents[0], "injected instructions",
+            "env-var files should appear before ancestor-walk files"
+        );
+
+        unsafe { std::env::remove_var("CLAW_INSTRUCTION_FILES") };
+        fs::remove_dir_all(root).expect("cleanup root");
+        fs::remove_dir_all(extra_dir).expect("cleanup extra_dir");
     }
 
     #[test]
