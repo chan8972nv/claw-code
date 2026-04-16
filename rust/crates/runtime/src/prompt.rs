@@ -676,6 +676,7 @@ mod tests {
         let extra_dir = temp_dir();
         let cwd = root.join("work");
         fs::create_dir_all(&cwd).expect("cwd dir");
+        fs::create_dir_all(&extra_dir).expect("extra dir");
 
         // Instruction file outside the ancestor chain of cwd.
         fs::write(extra_dir.join("CLAUDE.md"), "injected instructions")
@@ -685,9 +686,7 @@ mod tests {
             .expect("write ancestor CLAUDE.md");
 
         let env_val = extra_dir.join("CLAUDE.md").display().to_string();
-        // Safety: this test is single-threaded via the serial attribute pattern
-        // used by other tests in this module. Setting env vars is safe here.
-        unsafe { std::env::set_var("CLAW_INSTRUCTION_FILES", &env_val) };
+        std::env::set_var("CLAW_INSTRUCTION_FILES", &env_val);
 
         let context = ProjectContext::discover(&cwd, "2026-04-15").expect("context should load");
         let contents: Vec<&str> = context
@@ -710,7 +709,7 @@ mod tests {
             "env-var files should appear before ancestor-walk files"
         );
 
-        unsafe { std::env::remove_var("CLAW_INSTRUCTION_FILES") };
+        std::env::remove_var("CLAW_INSTRUCTION_FILES");
         fs::remove_dir_all(root).expect("cleanup root");
         fs::remove_dir_all(extra_dir).expect("cleanup extra_dir");
     }
