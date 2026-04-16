@@ -125,7 +125,15 @@ impl ApiError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
+            // `is_decode` / `is_body` cover truncated-response and mid-body read
+            // failures, which are transport-level transients — not schema bugs.
+            Self::Http(error) => {
+                error.is_connect()
+                    || error.is_timeout()
+                    || error.is_request()
+                    || error.is_decode()
+                    || error.is_body()
+            }
             Self::Api { retryable, .. } => *retryable,
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
             Self::MissingCredentials { .. }

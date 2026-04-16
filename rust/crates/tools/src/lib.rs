@@ -528,20 +528,28 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TodoWrite",
-            description: "Update the structured task list for the current session.",
+            description: "Maintain the session's task list. Use when a task has multiple steps or when the plan needs to be revised mid-work. Keep at most one item `in_progress` at a time, and flip each item to `completed` as soon as it lands — do not batch completions. Each item needs a concrete imperative `content` (e.g. \"Add retry on body-read failures\") and a present-continuous `activeForm` (\"Adding retry on body-read failures\"); vague todos (\"investigate\", \"fix the bug\") defeat the purpose — every item must be specific and falsifiable. Replace the full list on each call (the `todos` array is the new authoritative state, not a delta).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "todos": {
                         "type": "array",
+                        "description": "The complete, replacement task list for this session. Every call overwrites the previous list.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "content": { "type": "string" },
-                                "activeForm": { "type": "string" },
+                                "content": {
+                                    "type": "string",
+                                    "description": "Imperative description of the step (e.g. \"Fix null-check in parser.rs\"). Must be specific."
+                                },
+                                "activeForm": {
+                                    "type": "string",
+                                    "description": "Present-continuous form shown while the item is in_progress (e.g. \"Fixing null-check in parser.rs\")."
+                                },
                                 "status": {
                                     "type": "string",
-                                    "enum": ["pending", "in_progress", "completed"]
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Lifecycle state. Keep at most one item in_progress."
                                 }
                             },
                             "required": ["content", "activeForm", "status"],
