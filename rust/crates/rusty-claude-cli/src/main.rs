@@ -12777,6 +12777,7 @@ struct AnthropicRuntimeClient {
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
     thinking: Option<api::ThinkingConfig>,
+    parallel_tool_calls: Option<bool>,
 }
 
 impl AnthropicRuntimeClient {
@@ -12832,6 +12833,7 @@ impl AnthropicRuntimeClient {
             }
         };
         let thinking = thinking_config_from_env();
+        let parallel_tool_calls = parallel_tool_calls_from_env();
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -12844,6 +12846,7 @@ impl AnthropicRuntimeClient {
             progress_reporter,
             reasoning_effort: None,
             thinking,
+            parallel_tool_calls,
         })
     }
 
@@ -12879,6 +12882,24 @@ fn thinking_config_from_env() -> Option<api::ThinkingConfig> {
     }
 }
 
+/// Read parallel tool call preference from the `CLAW_PARALLEL_TOOLS` env var.
+///
+/// When set to `1`/`true`, the model is allowed to emit multiple `tool_calls`
+/// in a single response. Honored by OpenAI-compatible providers (vLLM,
+/// MiniMax, OpenAI) via the `parallel_tool_calls` request field. Anthropic
+/// native ignores the flag (it's stripped from the body server-side via
+/// `strip_unsupported_beta_body_fields`).
+///
+/// Returns `None` when unset or unrecognized, which preserves the provider's
+/// default behavior. Returns `Some(true)`/`Some(false)` for explicit opt-in.
+fn parallel_tool_calls_from_env() -> Option<bool> {
+    match env::var("CLAW_PARALLEL_TOOLS").ok().as_deref() {
+        Some("1" | "true" | "TRUE" | "True" | "yes" | "YES") => Some(true),
+        Some("0" | "false" | "FALSE" | "False" | "no" | "NO") => Some(false),
+        _ => None,
+    }
+}
+
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     Ok(resolve_cli_auth_source_for_cwd()?)
 }
@@ -12907,6 +12928,7 @@ impl ApiClient for AnthropicRuntimeClient {
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
             thinking: self.thinking.clone(),
+            parallel_tool_calls: self.parallel_tool_calls,
             ..Default::default()
         };
 

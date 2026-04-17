@@ -1227,6 +1227,12 @@ fn build_chat_completion_request_for_base_url(
         payload["thinking"] = serde_json::to_value(thinking).unwrap_or_default();
     }
 
+    // parallel_tool_calls: when set, the model may emit multiple tool_calls per response.
+    // vLLM, OpenAI, and OpenAI-compatible providers honor this at the request level.
+    if let Some(parallel) = request.parallel_tool_calls {
+        payload["parallel_tool_calls"] = json!(parallel);
+    }
+
     for (key, value) in &request.extra_body {
         if is_protected_extra_body_key(key) {
             continue;
@@ -2402,7 +2408,7 @@ mod tests {
             presence_penalty: Some(0.3),
             stop: Some(vec!["\n".to_string()]),
             reasoning_effort: None,
-            extra_body: BTreeMap::new(),
+            ..Default::default()
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
         assert_eq!(payload["temperature"], 0.7);
