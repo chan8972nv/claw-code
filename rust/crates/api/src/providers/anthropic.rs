@@ -988,6 +988,10 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
         // These fields are OpenAI-compatible only; Anthropic rejects them.
         object.remove("frequency_penalty");
         object.remove("presence_penalty");
+        // Anthropic controls parallel tool use via `tool_choice.disable_parallel_tool_use`,
+        // not via a top-level `parallel_tool_calls` field. Strip it so requests built
+        // for OpenAI-compat still work when routed to the Anthropic provider.
+        object.remove("parallel_tool_calls");
         // Anthropic uses "stop_sequences" not "stop". Convert if present.
         if let Some(stop_val) = object.remove("stop") {
             if stop_val.as_array().is_some_and(|a| !a.is_empty()) {

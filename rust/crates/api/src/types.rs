@@ -41,6 +41,12 @@ pub struct MessageRequest {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    /// When set, allows the model to emit multiple `tool_calls` in a single
+    /// response (OpenAI-compatible providers only). Stripped from the body on
+    /// the Anthropic native path — Anthropic controls this via
+    /// `tool_choice.disable_parallel_tool_use` instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 impl MessageRequest {
