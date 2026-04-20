@@ -2948,8 +2948,10 @@ fn resolve_model_alias_with_config(model: &str) -> String {
 }
 
 /// Validate model syntax at parse time.
-/// Accepts: known aliases (opus, sonnet, haiku) or provider/model pattern.
-/// Rejects: empty, whitespace-only, strings with spaces, or invalid chars.
+/// Accepts: known aliases (opus, sonnet, haiku), provider/model pattern, or
+/// absolute filesystem paths (for OpenAI-compatible servers that serve a model
+/// under its on-disk path, e.g. local vLLM checkpoints).
+/// Rejects: empty, whitespace-only, or strings with spaces.
 fn validate_model_syntax(model: &str) -> Result<(), String> {
     let trimmed = model.trim();
     // Ollama models use names like "qwen3:8b" that don't match provider/model
@@ -2973,6 +2975,11 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     if is_bare_provider_model(trimmed) {
         return Ok(());
     }
+    // Absolute filesystem paths are accepted (local OpenAI-compat servers
+    // often serve a model id equal to its on-disk path).
+    if trimmed.starts_with('/') {
+        return Ok(());
+    }
     if is_local_openai_model_syntax(trimmed) {
         return Ok(());
     }
@@ -2981,7 +2988,7 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
         // #154: hint if the model looks like it belongs to a different provider
         let mut err_msg = format!(
-            "invalid model syntax: '{}'.\nExpected provider/model (e.g., anthropic/claude-opus-4-7)",
+            "invalid model syntax: '{}'.\nExpected provider/model (e.g., anthropic/claude-opus-4-7), known alias (opus, sonnet, haiku), or absolute path",
             trimmed
         );
         if trimmed.starts_with("gpt-") || trimmed.starts_with("gpt_") {
