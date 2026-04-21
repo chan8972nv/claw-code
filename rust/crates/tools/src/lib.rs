@@ -3464,6 +3464,19 @@ const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
+fn default_agent_model() -> String {
+    // Allow the embedding harness to override the subagent model via env.
+    // This is what lets SWE-bench runs route subagents through the same
+    // OpenAI-compatible vLLM endpoint the main agent is already using
+    // (e.g. CLAW_AGENT_MODEL=openai/<served-model>) instead of hitting
+    // the Anthropic gateway with no credentials.
+    std::env::var("CLAW_AGENT_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string())
+}
+
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
     execute_agent_with_spawn(input, spawn_agent_job)
 }
@@ -3591,7 +3604,7 @@ fn build_agent_runtime(
         .manifest
         .model
         .clone()
-        .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
+        .unwrap_or_else(default_agent_model);
     let allowed_tools = job.allowed_tools.clone();
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
     let permission_policy = agent_permission_policy();
@@ -3625,8 +3638,8 @@ fn resolve_agent_model(model: Option<&str>) -> String {
     model
         .map(str::trim)
         .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
+        .map(str::to_string)
+        .unwrap_or_else(default_agent_model)
 }
 
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
@@ -3661,6 +3674,14 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "WebSearch",
             "ToolSearch",
             "TodoWrite",
+            "StructuredOutput",
+        ],
+        "DiffReview" => vec![
+            // Context-isolated reviewer: sees only the bug + the diff.
+            // Intentionally no write tools and no web access — this is a
+            // sanity check on a patch that already exists.
+            "bash",
+            "read_file",
             "StructuredOutput",
         ],
         "claw-guide" => vec![
@@ -8368,6 +8389,42 @@ mod tests {
         assert!(verification.contains("bash"));
         assert!(!verification.contains("PowerShell")); // PowerShell removed
         assert!(!verification.contains("write_file"));
+
+        let diff_review = allowed_tools_for_subagent("DiffReview");
+        assert!(diff_review.contains("bash"));
+        assert!(diff_review.contains("read_file"));
+        assert!(diff_review.contains("StructuredOutput"));
+        assert!(!diff_review.contains("write_file"));
+        assert!(!diff_review.contains("edit_file"));
+        assert!(!diff_review.contains("WebFetch"));
+    }
+
+    #[test]
+    fn default_agent_model_respects_env_override() {
+        use super::default_agent_model;
+        // Guard against parallel tests racing on the same env var.
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("env lock");
+
+        let original = std::env::var("CLAW_AGENT_MODEL").ok();
+
+        std::env::remove_var("CLAW_AGENT_MODEL");
+        assert_eq!(default_agent_model(), "claude-opus-4-6");
+
+        std::env::set_var("CLAW_AGENT_MODEL", "openai/my-vllm-model");
+        assert_eq!(default_agent_model(), "openai/my-vllm-model");
+
+        // Whitespace-only should be ignored and fall back to the const.
+        std::env::set_var("CLAW_AGENT_MODEL", "   ");
+        assert_eq!(default_agent_model(), "claude-opus-4-6");
+
+        match original {
+            Some(value) => std::env::set_var("CLAW_AGENT_MODEL", value),
+            None => std::env::remove_var("CLAW_AGENT_MODEL"),
+        }
     }
 
     #[derive(Debug)]

@@ -280,7 +280,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_iterations,
             output_file,
             session_dir,
-        } => solve_problem(problem_file, &problem, model, max_iterations, output_file, session_dir)?,
+        } => solve_problem(
+            problem_file,
+            &problem,
+            model,
+            max_iterations,
+            output_file,
+            session_dir,
+        )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -1107,11 +1114,20 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     if trimmed.starts_with('/') {
         return Ok(());
     }
-    // Check provider/model format: provider_id/model_id
+    // Check provider/model format. Most names are two-segment
+    // (e.g. anthropic/claude-opus-4-6). Multi-segment ids are accepted only
+    // when they embed a known provider path component ("/openai/" or
+    // "/anthropic/"), which covers gateway routes like
+    // "aws/anthropic/bedrock-claude-opus-4-7" forwarded verbatim through
+    // an OpenAI-compat proxy.
     let parts: Vec<&str> = trimmed.split('/').collect();
-    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+    let has_empty_segment = parts.iter().any(|p| p.is_empty());
+    let is_two_segment = parts.len() == 2;
+    let is_provider_gateway =
+        parts.len() > 2 && (trimmed.contains("/openai/") || trimmed.contains("/anthropic/"));
+    if has_empty_segment || (!is_two_segment && !is_provider_gateway) {
         return Err(format!(
-            "invalid model syntax: '{}'. Expected provider/model (e.g., anthropic/claude-opus-4-6), known alias (opus, sonnet, haiku), or absolute path",
+            "invalid model syntax: '{}'. Expected provider/model (e.g., anthropic/claude-opus-4-6), known alias (opus, sonnet, haiku), absolute path, or a */openai/* or */anthropic/* gateway id",
             trimmed
         ));
     }
@@ -8651,10 +8667,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  claw solve [--problem-file FILE] [--max-iterations N] [--output-file FILE] [--session-dir DIR] [PROBLEM...]"
     )?;
-    writeln!(
-        out,
-        "      Run headless solve mode for evaluation"
-    )?;
+    writeln!(out, "      Run headless solve mode for evaluation")?;
     writeln!(out)?;
     writeln!(out, "Flags:")?;
     writeln!(
@@ -8779,11 +8792,11 @@ mod tests {
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
-        summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        STUB_COMMANDS,
+        summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_model_syntax,
+        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
+        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        LocalHelpTopic, PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -9402,6 +9415,28 @@ mod tests {
         assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-6");
         assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20251213");
         assert_eq!(resolve_model_alias("claude-opus"), "claude-opus");
+    }
+
+    #[test]
+    fn validate_model_syntax_gateway_multi_segment_ids() {
+        // Two-segment provider/model still OK.
+        assert!(validate_model_syntax("anthropic/claude-opus-4-6").is_ok());
+        // Multi-segment accepted only when an openai/anthropic segment is embedded
+        // (matches */openai/* or */anthropic/* — gateway routes like NVIDIA NIM
+        // or Bedrock proxies).
+        assert!(validate_model_syntax("aws/anthropic/bedrock-claude-opus-4-7").is_ok());
+        assert!(validate_model_syntax("vendor/openai/gpt-4o").is_ok());
+        assert!(validate_model_syntax("a/openai/b/c").is_ok());
+        // Multi-segment without a known gateway marker is still rejected.
+        assert!(validate_model_syntax("aws/bedrock/claude").is_err());
+        assert!(validate_model_syntax("foo/bar/baz").is_err());
+        // Empty segments fail.
+        assert!(validate_model_syntax("foo//bar").is_err());
+        assert!(validate_model_syntax("openai//gpt").is_err());
+        // Leading-/ falls through absolute-path branch above.
+        assert!(validate_model_syntax("/leading").is_ok());
+        // Single-segment still fails.
+        assert!(validate_model_syntax("singleton").is_err());
     }
 
     #[test]
