@@ -2597,6 +2597,17 @@ struct AgentOutput {
     derived_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Final assistant response from the sub-agent. Populated only when the
+    /// sub-agent ran to completion under synchronous mode
+    /// (CLAW_AGENT_SYNCHRONOUS=1); skipped otherwise so asynchronous
+    /// behavior is unchanged. Gives the caller the verdict text without a
+    /// follow-up read_file on the `.md` output.
+    #[serde(
+        rename = "finalResponse",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    final_response: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3478,7 +3489,96 @@ fn default_agent_model() -> String {
 }
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
-    execute_agent_with_spawn(input, spawn_agent_job)
+    if agent_sync_enabled() {
+        let timeout = agent_sync_timeout();
+        let manifest = execute_agent_with_spawn(input, move |job| {
+            run_agent_job_synchronous(job, timeout)
+        })?;
+        // In sync mode the background thread has already persisted the
+        // terminal state; re-read the manifest so the caller sees
+        // status=completed/failed/timeout instead of the stale "running"
+        // record that execute_agent_with_spawn returns by default.
+        Ok(read_agent_manifest(&manifest.manifest_file).unwrap_or(manifest))
+    } else {
+        execute_agent_with_spawn(input, spawn_agent_job)
+    }
+}
+
+fn agent_sync_enabled() -> bool {
+    std::env::var("CLAW_AGENT_SYNCHRONOUS")
+        .ok()
+        .map(|v| {
+            let normalized = v.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+const DEFAULT_AGENT_SYNC_TIMEOUT_SECS: u64 = 600;
+
+fn agent_sync_timeout() -> std::time::Duration {
+    let secs = std::env::var("CLAW_AGENT_SYNC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_AGENT_SYNC_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+fn read_agent_manifest(path: &str) -> Result<AgentOutput, String> {
+    let data = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    serde_json::from_str::<AgentOutput>(&data).map_err(|error| error.to_string())
+}
+
+/// Run a sub-agent job to completion in a worker thread and block the caller
+/// until the thread either finishes or `timeout` elapses. On timeout we
+/// persist a "failed" terminal state with a timeout message so the manifest
+/// on disk always reflects a terminal status before this function returns.
+/// The background thread may continue running after timeout — its eventual
+/// terminal write will simply overwrite the timeout record, which is
+/// harmless since the main agent has already received its answer.
+fn run_agent_job_synchronous(job: AgentJob, timeout: std::time::Duration) -> Result<(), String> {
+    let manifest_for_timeout = job.manifest.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name(format!("clawd-agent-sync-{}", job.manifest.agent_id))
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_agent_job(&job)
+            }));
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let _ =
+                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
+                }
+                Err(_) => {
+                    let _ = persist_agent_terminal_state(
+                        &job.manifest,
+                        "failed",
+                        None,
+                        Some(String::from("sub-agent thread panicked")),
+                    );
+                }
+            }
+            // Receiver may already be gone if the parent timed out; that is
+            // fine — we deliberately don't surface send errors here.
+            let _ = tx.send(());
+        })
+        .map_err(|error| error.to_string())?;
+
+    match rx.recv_timeout(timeout) {
+        Ok(()) => Ok(()),
+        Err(_) => persist_agent_terminal_state(
+            &manifest_for_timeout,
+            "failed",
+            None,
+            Some(format!(
+                "sub-agent timed out after {}s (CLAW_AGENT_SYNC_TIMEOUT_SECS)",
+                timeout.as_secs()
+            )),
+        ),
+    }
 }
 
 fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
@@ -3542,6 +3642,7 @@ where
         current_blocker: None,
         derived_state: String::from("working"),
         error: None,
+        final_response: None,
     };
     write_agent_manifest(&manifest)?;
 
@@ -3757,6 +3858,10 @@ fn persist_agent_terminal_state(
     next_manifest.current_blocker.clone_from(&blocker);
     next_manifest.derived_state =
         derive_agent_state(status, result, error.as_deref(), blocker.as_ref()).to_string();
+    next_manifest.final_response = result
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     next_manifest.error = error;
     if let Some(blocker) = blocker {
         next_manifest
@@ -8397,6 +8502,135 @@ mod tests {
         assert!(!diff_review.contains("write_file"));
         assert!(!diff_review.contains("edit_file"));
         assert!(!diff_review.contains("WebFetch"));
+    }
+
+    #[test]
+    fn agent_sync_env_helpers_parse_expected_values() {
+        use super::{
+            agent_sync_enabled, agent_sync_timeout, DEFAULT_AGENT_SYNC_TIMEOUT_SECS,
+        };
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("env lock");
+
+        let saved_flag = std::env::var("CLAW_AGENT_SYNCHRONOUS").ok();
+        let saved_timeout = std::env::var("CLAW_AGENT_SYNC_TIMEOUT_SECS").ok();
+
+        // Unset → defaults
+        std::env::remove_var("CLAW_AGENT_SYNCHRONOUS");
+        std::env::remove_var("CLAW_AGENT_SYNC_TIMEOUT_SECS");
+        assert!(!agent_sync_enabled());
+        assert_eq!(
+            agent_sync_timeout(),
+            std::time::Duration::from_secs(DEFAULT_AGENT_SYNC_TIMEOUT_SECS)
+        );
+
+        // Enabled values
+        for truthy in ["1", "true", "TRUE", "Yes", "on", "  yes  "] {
+            std::env::set_var("CLAW_AGENT_SYNCHRONOUS", truthy);
+            assert!(
+                agent_sync_enabled(),
+                "expected {truthy:?} to enable sync mode"
+            );
+        }
+
+        // Disabled values
+        for falsy in ["0", "false", "no", "off", "", "  "] {
+            std::env::set_var("CLAW_AGENT_SYNCHRONOUS", falsy);
+            assert!(
+                !agent_sync_enabled(),
+                "expected {falsy:?} to keep sync disabled"
+            );
+        }
+
+        // Timeout override (including leading/trailing whitespace) and rejection of zero/garbage
+        std::env::set_var("CLAW_AGENT_SYNC_TIMEOUT_SECS", " 42 ");
+        assert_eq!(agent_sync_timeout(), std::time::Duration::from_secs(42));
+        std::env::set_var("CLAW_AGENT_SYNC_TIMEOUT_SECS", "0");
+        assert_eq!(
+            agent_sync_timeout(),
+            std::time::Duration::from_secs(DEFAULT_AGENT_SYNC_TIMEOUT_SECS)
+        );
+        std::env::set_var("CLAW_AGENT_SYNC_TIMEOUT_SECS", "not-a-number");
+        assert_eq!(
+            agent_sync_timeout(),
+            std::time::Duration::from_secs(DEFAULT_AGENT_SYNC_TIMEOUT_SECS)
+        );
+
+        match saved_flag {
+            Some(value) => std::env::set_var("CLAW_AGENT_SYNCHRONOUS", value),
+            None => std::env::remove_var("CLAW_AGENT_SYNCHRONOUS"),
+        }
+        match saved_timeout {
+            Some(value) => std::env::set_var("CLAW_AGENT_SYNC_TIMEOUT_SECS", value),
+            None => std::env::remove_var("CLAW_AGENT_SYNC_TIMEOUT_SECS"),
+        }
+    }
+
+    #[test]
+    fn persist_terminal_state_populates_final_response_on_completion() {
+        // Verify that the manifest on disk carries `finalResponse` when the
+        // sub-agent completed, and omits it on a credential/failure path.
+        let completed = execute_agent_with_spawn(
+            AgentInput {
+                description: "Sync-mode verification".to_string(),
+                prompt: "Run the tests".to_string(),
+                subagent_type: Some("Verification".to_string()),
+                name: Some("sync-verif".to_string()),
+                model: Some("claude-sonnet-4-6".to_string()),
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "completed",
+                    Some("  358 tests passed, 0 failed  "),
+                    None,
+                )
+            },
+        )
+        .expect("sync-mode completion path should succeed");
+
+        let on_disk: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&completed.manifest_file)
+                .expect("manifest exists on disk"),
+        )
+        .expect("manifest parses");
+        assert_eq!(on_disk["status"], "completed");
+        // The helper trims whitespace before persisting.
+        assert_eq!(on_disk["finalResponse"], "358 tests passed, 0 failed");
+
+        let failed = execute_agent_with_spawn(
+            AgentInput {
+                description: "Sync-mode failure".to_string(),
+                prompt: "Attempt the work".to_string(),
+                subagent_type: Some("Verification".to_string()),
+                name: Some("sync-failed".to_string()),
+                model: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "failed",
+                    None,
+                    Some(String::from("simulated error")),
+                )
+            },
+        )
+        .expect("failure path should still produce a manifest");
+        let on_disk_failed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&failed.manifest_file)
+                .expect("failed manifest exists"),
+        )
+        .expect("failed manifest parses");
+        assert_eq!(on_disk_failed["status"], "failed");
+        // No result text → finalResponse is omitted from serialization.
+        assert!(
+            on_disk_failed.get("finalResponse").is_none()
+                || on_disk_failed["finalResponse"].is_null(),
+            "failed manifest must not carry a finalResponse: {on_disk_failed}"
+        );
     }
 
     #[test]
