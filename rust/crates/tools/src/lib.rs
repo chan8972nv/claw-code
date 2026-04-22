@@ -3473,7 +3473,11 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
-const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
+// Bumped from 32 to 64 because Verification sub-agents routinely need
+// several bash rounds (pip install missing deps + run pytest); 32 was
+// too tight and surfaced as `conversation loop exceeded the maximum
+// number of iterations` failures in session_m54_25k.
+const DEFAULT_AGENT_MAX_ITERATIONS: usize = 64;
 
 fn default_agent_model() -> String {
     // Allow the embedding harness to override the subagent model via env.
