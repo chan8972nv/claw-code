@@ -3483,13 +3483,17 @@ const DEFAULT_AGENT_MAX_ITERATIONS: usize = 64;
 
 /// Per-subagent-type iteration caps. Verification gets the most headroom
 /// because a full pytest run on a slow suite (astropy, sphinx) can need
-/// many bash turns just to interpret the output. DiffReview / Explore
-/// are deliberately capped tighter: they only read and summarize, so a
-/// runaway loop is always wrong.
+/// many bash turns just to interpret the output. All other types stay at
+/// the default 64 — in m611/m612 we saw that tightening DiffReview to 48
+/// caused its "unparseable verdict" rate to double (14 → 27 of ~515
+/// completions): DR runs that used to finish the strict 4-line format
+/// at turns 30-40 were getting cut off mid-reasoning and falling back
+/// to tail-scan recovery, which produced more false-positive SHIPs on
+/// patches that were about to be REVISEd. Keep DR at 64 until we have
+/// data that a tighter cap helps.
 fn max_iterations_for_subagent(subagent_type: &str) -> usize {
     match subagent_type {
         "Verification" => 128,
-        "DiffReview" | "Explore" | "Plan" | "claw-guide" => 48,
         _ => DEFAULT_AGENT_MAX_ITERATIONS,
     }
 }
@@ -8532,25 +8536,26 @@ mod tests {
     #[test]
     fn max_iterations_per_subagent_type_is_correct() {
         use super::{max_iterations_for_subagent, DEFAULT_AGENT_MAX_ITERATIONS};
-        // Verification needs the most — full pytest runs take many bash turns.
+        // Verification needs extra headroom — a full pytest run on a
+        // slow suite can need many bash turns to interpret output.
         assert_eq!(max_iterations_for_subagent("Verification"), 128);
-        // Read-only / short-output types are capped tighter.
-        for short in ["DiffReview", "Explore", "Plan", "claw-guide"] {
+        // Everything else — DR, Explore, Plan, claw-guide, unknown,
+        // general-purpose — stays at the default. m611/m612 showed that
+        // tightening DR below the default hurt verdict quality.
+        for other in [
+            "DiffReview",
+            "Explore",
+            "Plan",
+            "claw-guide",
+            "general-purpose",
+            "unknown-type",
+        ] {
             assert_eq!(
-                max_iterations_for_subagent(short),
-                48,
-                "{short} should use the short-task cap"
+                max_iterations_for_subagent(other),
+                DEFAULT_AGENT_MAX_ITERATIONS,
+                "{other} should use the default cap"
             );
         }
-        // Unknown / general-purpose falls back to the default.
-        assert_eq!(
-            max_iterations_for_subagent("general-purpose"),
-            DEFAULT_AGENT_MAX_ITERATIONS
-        );
-        assert_eq!(
-            max_iterations_for_subagent("unknown-type"),
-            DEFAULT_AGENT_MAX_ITERATIONS
-        );
     }
 
     #[test]
