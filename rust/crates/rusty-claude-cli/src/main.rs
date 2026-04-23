@@ -2948,9 +2948,12 @@ fn resolve_model_alias_with_config(model: &str) -> String {
 }
 
 /// Validate model syntax at parse time.
-/// Accepts: known aliases (opus, sonnet, haiku), provider/model pattern, or
-/// absolute filesystem paths (for OpenAI-compatible servers that serve a model
-/// under its on-disk path, e.g. local vLLM checkpoints).
+/// Accepts: known aliases (opus, sonnet, haiku), provider/model pattern,
+/// multi-segment gateway IDs embedding a known provider segment (for
+/// NVIDIA NIM / AWS Bedrock style paths like `azure/anthropic/claude-opus-4-6`
+/// or `aws/anthropic/bedrock-claude-opus-4-7`), or absolute filesystem paths
+/// (for OpenAI-compatible servers that serve a model under its on-disk path,
+/// e.g. local vLLM checkpoints).
 /// Rejects: empty, whitespace-only, or strings with spaces.
 fn validate_model_syntax(model: &str) -> Result<(), String> {
     let trimmed = model.trim();
@@ -2983,12 +2986,24 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     if is_local_openai_model_syntax(trimmed) {
         return Ok(());
     }
-    // Check provider/model format: provider_id/model_id
+    // Multi-segment gateway model IDs (>= 3 slash-separated parts) are
+    // accepted when they embed a known provider segment. This matches
+    // */openai/* and */anthropic/* routes used by gateways like NVIDIA NIM
+    // (azure/anthropic/claude-opus-4-6) and AWS Bedrock
+    // (aws/anthropic/bedrock-claude-opus-4-7). Provider routing later
+    // canonicalizes the embedded segment via detect_provider_kind.
     let parts: Vec<&str> = trimmed.split('/').collect();
+    if parts.len() > 2
+        && !parts.iter().any(|p| p.is_empty())
+        && (trimmed.contains("/openai/") || trimmed.contains("/anthropic/"))
+    {
+        return Ok(());
+    }
+    // Check provider/model format: provider_id/model_id
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
         // #154: hint if the model looks like it belongs to a different provider
         let mut err_msg = format!(
-            "invalid model syntax: '{}'.\nExpected provider/model (e.g., anthropic/claude-opus-4-7), known alias (opus, sonnet, haiku), or absolute path",
+            "invalid model syntax: '{}'.\nExpected provider/model (e.g., anthropic/claude-opus-4-7), a */openai/* or */anthropic/* gateway id, known alias (opus, sonnet, haiku), or absolute path",
             trimmed
         );
         if trimmed.starts_with("gpt-") || trimmed.starts_with("gpt_") {
