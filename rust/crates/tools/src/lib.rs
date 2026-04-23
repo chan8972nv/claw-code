@@ -3462,7 +3462,13 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
-const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
+// Bumped from 32 to 64: full pytest runs on slow suites (astropy /
+// sympy / sphinx) routinely need more than 32 bash rounds to install
+// deps + run tests + interpret output. m54 saw 8 Verification
+// `conversation loop exceeded the maximum number of iterations`
+// failures at cap=32; those went to ~0 at cap=64. Safe headroom that
+// only costs extra tokens when a subagent genuinely needs them.
+const DEFAULT_AGENT_MAX_ITERATIONS: usize = 64;
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
     execute_agent_with_spawn(input, spawn_agent_job)
