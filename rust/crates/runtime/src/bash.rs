@@ -178,12 +178,13 @@ async fn execute_bash_async(
     // Models typically specify timeout in seconds (e.g. 120 for 2 minutes),
     // but Duration::from_millis expects milliseconds.  Heuristic: if the value
     // is ≤ 1000 it was almost certainly meant as seconds — convert to ms.
-    // Default to 1_200_000 ms (20 minutes) when no timeout is given so that
-    // long-running test suites don't hang forever.
+    // Default to 3_600_000 ms (60 minutes) when no timeout is given so that
+    // long-running test suites on slow SWE-bench projects (sympy, astropy,
+    // matplotlib full suites) don't hit a premature cap.
     let effective_timeout_ms = match input.timeout {
         Some(v) if v <= 1000 => v * 1000,
         Some(v) => v,
-        None => 1_200_000,
+        None => 3_600_000,
     };
     let output_result = match timeout(Duration::from_millis(effective_timeout_ms), command.output()).await {
         Ok(result) => (result?, false),

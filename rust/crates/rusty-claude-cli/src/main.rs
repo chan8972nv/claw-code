@@ -165,7 +165,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
-const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/claw-code";
@@ -2505,7 +2505,7 @@ fn looks_like_slash_command_token(token: &str) -> bool {
 
 fn parse_solve_args(args: &[String], model: String) -> Result<CliAction, String> {
     let mut problem_file = None;
-    let mut max_iterations = 200;
+    let mut max_iterations = 500;
     let mut output_file = None;
     let mut session_dir = None;
     let mut remaining = Vec::new();
