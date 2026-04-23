@@ -3473,11 +3473,26 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
-// Bumped from 32 to 64 because Verification sub-agents routinely need
-// several bash rounds (pip install missing deps + run pytest); 32 was
-// too tight and surfaced as `conversation loop exceeded the maximum
-// number of iterations` failures in session_m54_25k.
+// Default cap for subagent conversation loops. Bumped from 32 to 64
+// after session_m54_25k surfaced `conversation loop exceeded the
+// maximum number of iterations` failures on Verification (pip install
+// deps + run pytest + interpret output took > 32 turns). m61 showed 7
+// Verification max_iter failures remaining at 64, so Verification now
+// gets a dedicated higher cap (see max_iterations_for_subagent).
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 64;
+
+/// Per-subagent-type iteration caps. Verification gets the most headroom
+/// because a full pytest run on a slow suite (astropy, sphinx) can need
+/// many bash turns just to interpret the output. DiffReview / Explore
+/// are deliberately capped tighter: they only read and summarize, so a
+/// runaway loop is always wrong.
+fn max_iterations_for_subagent(subagent_type: &str) -> usize {
+    match subagent_type {
+        "Verification" => 128,
+        "DiffReview" | "Explore" | "Plan" | "claw-guide" => 48,
+        _ => DEFAULT_AGENT_MAX_ITERATIONS,
+    }
+}
 
 fn default_agent_model() -> String {
     // Allow the embedding harness to override the subagent model via env.
@@ -3694,7 +3709,13 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
 }
 
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
-    let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+    let subagent_type = job
+        .manifest
+        .subagent_type
+        .as_deref()
+        .unwrap_or("general-purpose");
+    let max_iter = max_iterations_for_subagent(subagent_type);
+    let mut runtime = build_agent_runtime(job)?.with_max_iterations(max_iter);
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
@@ -8506,6 +8527,30 @@ mod tests {
         assert!(!diff_review.contains("write_file"));
         assert!(!diff_review.contains("edit_file"));
         assert!(!diff_review.contains("WebFetch"));
+    }
+
+    #[test]
+    fn max_iterations_per_subagent_type_is_correct() {
+        use super::{max_iterations_for_subagent, DEFAULT_AGENT_MAX_ITERATIONS};
+        // Verification needs the most — full pytest runs take many bash turns.
+        assert_eq!(max_iterations_for_subagent("Verification"), 128);
+        // Read-only / short-output types are capped tighter.
+        for short in ["DiffReview", "Explore", "Plan", "claw-guide"] {
+            assert_eq!(
+                max_iterations_for_subagent(short),
+                48,
+                "{short} should use the short-task cap"
+            );
+        }
+        // Unknown / general-purpose falls back to the default.
+        assert_eq!(
+            max_iterations_for_subagent("general-purpose"),
+            DEFAULT_AGENT_MAX_ITERATIONS
+        );
+        assert_eq!(
+            max_iterations_for_subagent("unknown-type"),
+            DEFAULT_AGENT_MAX_ITERATIONS
+        );
     }
 
     #[test]
