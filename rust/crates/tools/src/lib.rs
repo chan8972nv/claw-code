@@ -6246,8 +6246,7 @@ mod tests {
         assert!(names.contains(&"NotebookEdit"));
         // Sleep, SendUserMessage, PowerShell removed (tool bloat reduction).
         // REPL is opt-in via CLAW_ENABLE_REPL=1; this test runs with the env
-        // var unset, so REPL must not appear. The opt-in path is verified by
-        // unsetting/setting the env var inside an isolated test below.
+        // var unset, so REPL must not appear.
         assert!(!names.contains(&"Sleep"));
         assert!(!names.contains(&"SendUserMessage"));
         assert!(
