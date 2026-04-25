@@ -383,7 +383,7 @@ fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn mvp_tool_specs() -> Vec<ToolSpec> {
-    vec![
+    let mut specs = vec![
         ToolSpec {
             name: "bash",
             description: "Execute a shell command in the current workspace.",
@@ -1088,7 +1088,34 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
-    ]
+    ];
+
+    // Opt-in REPL tool. Disabled by default (SWE-bench analysis showed REPL
+    // calls mostly failed because base miniconda lacked the repo's deps).
+    // Set CLAW_ENABLE_REPL=1 to re-register it; the SWE-bench harness pairs
+    // this with `conda activate testbed` so REPL inherits the right Python.
+    if std::env::var("CLAW_ENABLE_REPL").as_deref() == Ok("1") {
+        specs.push(ToolSpec {
+            name: "REPL",
+            description: "Execute a code snippet in a one-shot REPL (Python, JavaScript/Node, or Bash). Returns stdout, stderr, exit code, and duration. Inherits the parent process environment, so PATH/PYTHONPATH set by the harness apply.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string" },
+                    "language": {
+                        "type": "string",
+                        "enum": ["python", "py", "javascript", "js", "node", "sh", "shell", "bash"]
+                    },
+                    "timeout_ms": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["code", "language"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        });
+    }
+
+    specs
 }
 
 /// Check permission before executing a tool. Returns Err with denial reason if blocked.
@@ -1157,7 +1184,11 @@ fn execute_tool_with_enforcer(
         "StructuredOutput" => {
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
-        // REPL and PowerShell removed (tool bloat reduction)
+        // PowerShell remains removed; REPL is opt-in via CLAW_ENABLE_REPL=1
+        // (registration in mvp_tool_specs is gated, but we always handle the
+        // dispatch case so a stale request from a long-running session
+        // produces a clean error rather than the catch-all "unknown tool").
+        "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
         }
@@ -6213,10 +6244,17 @@ mod tests {
         assert!(names.contains(&"Agent"));
         assert!(names.contains(&"ToolSearch"));
         assert!(names.contains(&"NotebookEdit"));
-        // Sleep, SendUserMessage, REPL, PowerShell removed (tool bloat reduction)
+        // Sleep, SendUserMessage, PowerShell removed (tool bloat reduction).
+        // REPL is opt-in via CLAW_ENABLE_REPL=1; this test runs with the env
+        // var unset, so REPL must not appear. The opt-in path is verified by
+        // unsetting/setting the env var inside an isolated test below.
         assert!(!names.contains(&"Sleep"));
         assert!(!names.contains(&"SendUserMessage"));
-        assert!(!names.contains(&"REPL"));
+        assert!(
+            std::env::var("CLAW_ENABLE_REPL").as_deref() == Ok("1")
+                || !names.contains(&"REPL"),
+            "REPL should only appear when CLAW_ENABLE_REPL=1",
+        );
         assert!(!names.contains(&"PowerShell"));
         assert!(names.contains(&"Config"));
         assert!(names.contains(&"EnterPlanMode"));
