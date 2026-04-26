@@ -386,13 +386,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     let mut specs = vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace.",
+            description: "Execute a shell command. Each call spawns a fresh shell, so cwd is NOT preserved between calls. To run a command in a specific directory, set the `cwd` parameter — do NOT prefix the command with `cd <dir> && ...` (that idiom bloats every call and silently misroutes the command if the cd-prefix has a typo). Example: instead of `cd /workspace/foo && pytest -x`, pass `command=\"pytest -x\"` with `cwd=\"/workspace/foo\"`. Without `cwd`, the command runs from the harness's current directory.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
                     "timeout": { "type": "integer", "minimum": 1 },
                     "description": { "type": "string" },
+                    "cwd": { "type": "string", "description": "Working directory for the command. Use this instead of prefixing with `cd <dir> && ...`." },
                     "run_in_background": { "type": "boolean" },
                     "dangerouslyDisableSandbox": { "type": "boolean" },
                     "namespaceRestrictions": { "type": "boolean" },
@@ -1097,7 +1098,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     if std::env::var("CLAW_ENABLE_REPL").as_deref() == Ok("1") {
         specs.push(ToolSpec {
             name: "REPL",
-            description: "Execute a code snippet in a one-shot REPL (Python, JavaScript/Node, or Bash). Returns stdout, stderr, exit code, and duration. Inherits the parent process environment, so PATH/PYTHONPATH set by the harness apply.",
+            description: "Execute a code snippet in a one-shot REPL (Python, JavaScript/Node, or Bash). `code` is the raw program source for the chosen `language` — NOT a shell command line. When language=python, send Python statements directly: use os.chdir() / sys.path.insert() to control directory or imports; do NOT prefix with `cd <dir>` or wrap in `python -c '...'` (those are shell idioms — set language=bash instead if you need a shell). f-string expression slots cannot contain backslashes or unescaped quotes — assign to a temp variable first (`m = re.match(...).group(); print(f'match={m}')`). Returns stdout, stderr, exit code, and duration. Inherits the parent process environment, so PATH/PYTHONPATH set by the harness apply.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -5507,6 +5508,29 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
     if input.code.trim().is_empty() {
         return Err(String::from("code must not be empty"));
     }
+    // Detect shell idioms accidentally sent with language=python. Models often
+    // reach for `cd <dir> && python -c "..."` or bare `python -c '...'` and pass
+    // it as Python source; that produces an opaque "unterminated string literal"
+    // SyntaxError that wastes a turn. Catch it up front with a remediation hint.
+    let lang_lower = input.language.trim().to_ascii_lowercase();
+    if matches!(lang_lower.as_str(), "python" | "py") {
+        let first_line = input.code.trim_start().lines().next().unwrap_or("");
+        let looks_shellish = first_line.starts_with("cd ")
+            || first_line.starts_with('!')
+            || first_line.starts_with("bash ")
+            || first_line.starts_with("sh ")
+            || first_line.contains(" && ")
+            || regex_lite_python_dash_c(first_line);
+        if looks_shellish {
+            return Err(String::from(
+                "REPL.python expects raw Python source, not a shell command line. \
+                 The first line looks like a shell idiom (e.g. `cd <dir> && ...` \
+                 or `python -c '...'`). Either rewrite as Python (use os.chdir() \
+                 / subprocess.run() / sys.path.insert()), or call REPL again with \
+                 language=\"bash\" and pass plain shell.",
+            ));
+        }
+    }
     let runtime = resolve_repl_runtime(&input.language)?;
     let started = Instant::now();
     let mut process = Command::new(runtime.program);
@@ -5555,6 +5579,27 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
         exit_code: output.status.code().unwrap_or(1),
         duration_ms: started.elapsed().as_millis(),
     })
+}
+
+/// Heuristic match for `python` or `python3` followed by `-c`. Used by
+/// `execute_repl` to flag shell-idiom misuse without pulling in the regex
+/// crate.
+fn regex_lite_python_dash_c(line: &str) -> bool {
+    for prefix in ["python3 -c", "python -c"] {
+        if let Some(idx) = line.find(prefix) {
+            let before_ok = idx == 0
+                || line.as_bytes()[idx - 1].is_ascii_whitespace();
+            let after = &line[idx + prefix.len()..];
+            let after_ok = after
+                .chars()
+                .next()
+                .map_or(true, |c| c.is_ascii_whitespace());
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 struct ReplRuntime {

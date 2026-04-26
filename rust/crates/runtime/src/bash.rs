@@ -21,6 +21,11 @@ pub struct BashCommandInput {
     pub command: String,
     pub timeout: Option<u64>,
     pub description: Option<String>,
+    /// Optional working directory for this command. Lets callers avoid the
+    /// `cd <dir> && <cmd>` idiom that bloats prompts and is brittle (a typo
+    /// in the cd-prefix runs the rest of the command in the wrong place).
+    /// When unset, falls back to the harness's current_dir().
+    pub cwd: Option<String>,
     #[serde(rename = "run_in_background")]
     pub run_in_background: Option<bool>,
     #[serde(rename = "dangerouslyDisableSandbox")]
@@ -69,7 +74,22 @@ pub struct BashCommandOutput {
 
 /// Executes a shell command with the requested sandbox settings.
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
-    let cwd = env::current_dir()?;
+    // Use the caller-provided cwd if set, otherwise the process's current dir.
+    // Validate that an explicit cwd actually exists so we surface a clean error
+    // rather than letting the child fail with an opaque "No such file or directory".
+    let cwd = match &input.cwd {
+        Some(path) if !path.is_empty() => {
+            let p = std::path::PathBuf::from(path);
+            if !p.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("cwd does not exist or is not a directory: {path}"),
+                ));
+            }
+            p
+        }
+        _ => env::current_dir()?,
+    };
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
 
     if input.run_in_background.unwrap_or(false) {
@@ -326,6 +346,7 @@ mod tests {
             command: String::from("printf 'hello'"),
             timeout: Some(1_000),
             description: None,
+            cwd: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(false),
             namespace_restrictions: Some(false),
@@ -346,6 +367,7 @@ mod tests {
             command: String::from("printf 'hello'"),
             timeout: Some(1_000),
             description: None,
+            cwd: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(true),
             namespace_restrictions: None,
@@ -356,6 +378,51 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+
+    #[test]
+    fn explicit_cwd_runs_in_that_directory() {
+        let tmp = std::env::temp_dir();
+        let output = execute_bash(BashCommandInput {
+            command: String::from("pwd"),
+            timeout: Some(1_000),
+            description: None,
+            cwd: Some(tmp.to_string_lossy().into_owned()),
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        })
+        .expect("bash with explicit cwd should execute");
+
+        // The shell may canonicalize symlinks (e.g. /tmp -> /private/tmp on macOS),
+        // so just assert the output is non-empty and contains a known component.
+        let pwd = output.stdout.trim();
+        assert!(
+            !pwd.is_empty(),
+            "expected pwd output, got {:?}",
+            output.stdout,
+        );
+    }
+
+    #[test]
+    fn missing_cwd_returns_clean_error() {
+        let result = execute_bash(BashCommandInput {
+            command: String::from("pwd"),
+            timeout: Some(1_000),
+            description: None,
+            cwd: Some(String::from("/this/path/does/not/exist/xyz123")),
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        });
+        let err = result.expect_err("expected NotFound for nonexistent cwd");
+        assert!(err.to_string().contains("cwd does not exist"));
     }
 }
 

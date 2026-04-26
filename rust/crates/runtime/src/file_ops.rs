@@ -266,13 +266,33 @@ pub fn edit_file(
     if old_string == new_string {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "old_string and new_string must differ",
+            format!(
+                "old_string and new_string must differ — they are identical \
+                 ({len} chars). The patch you intended is missing: diff your \
+                 intended change against the current contents of {path} before \
+                 retrying.",
+                len = old_string.chars().count(),
+                path = absolute_path.display(),
+            ),
         ));
     }
     if !original_file.contains(old_string) {
+        // Compute a coarse fingerprint of the current file so the model can tell
+        // whether its mental snapshot is still valid. Most "old_string not found"
+        // failures are stale-context: the model is editing from a read_file
+        // result that's many turns old.
+        let file_len = original_file.len();
+        let line_count = original_file.lines().count();
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "old_string not found in file",
+            format!(
+                "old_string not found in file. Current state of {path}: \
+                 {file_len} bytes, {line_count} lines. Common cause: stale \
+                 snapshot — the file changed since you last read it (or another \
+                 edit shifted the surrounding context). Re-read the file with \
+                 read_file, locate the exact current text, then retry.",
+                path = absolute_path.display(),
+            ),
         ));
     }
 
