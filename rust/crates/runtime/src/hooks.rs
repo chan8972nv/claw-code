@@ -433,6 +433,20 @@ impl HookRunner {
         child.env("HOOK_TOOL_INPUT", tool_input);
         child.env("HOOK_TOOL_IS_ERROR", if is_error { "1" } else { "0" });
         if let Some(tool_output) = tool_output {
+            // ARG_MAX guard: HOOK_TOOL_OUTPUT joins the child's env block, which
+            // shares the kernel's ARG_MAX budget (~2 MiB on Linux) with argv.
+            // read_file on multi-megabyte auto-generated files (e.g. SWE-bench
+            // ansys/pyfluent tui.py at 3.3 MiB) pushes execve() over the limit
+            // and the hook fails to start with E2BIG (`Argument list too long`),
+            // killing the rest of the PostToolUse chain. Skip this hook command
+            // in that case — letting the chain continue is strictly better than
+            // failing it, and the agent never sees the dropped invocation.
+            const HOOK_TOOL_OUTPUT_MAX: usize = 256 * 1024;
+            if tool_output.len() > HOOK_TOOL_OUTPUT_MAX {
+                return HookCommandOutcome::Allow {
+                    parsed: ParsedHookOutput::default(),
+                };
+            }
             child.env("HOOK_TOOL_OUTPUT", tool_output);
         }
 
