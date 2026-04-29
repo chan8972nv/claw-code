@@ -1626,7 +1626,13 @@ impl StringExt for String {
 //
 // `string="false"` signals the parameter value should be parsed as a JSON
 // literal (true/false/number/array/object/null); otherwise it's a plain string.
-const DSML_TOOL_CALLS_OPEN: &str = "<\u{ff5c}DSML\u{ff5c}tool_calls>";
+// DeepSeek-V4 emits the OUTER opener without a trailing `>` (the model writes
+// `<｜DSML｜tool_calls\n<｜DSML｜invoke ...>`). Only the inner `invoke`/
+// `parameter` tags and the closer have `>`. Match the prefix only — the body
+// scan begins at the next `<｜DSML｜invoke ` regardless of what whitespace or
+// stray `>` sits between. This prefix can't collide with the closer because
+// the closer starts with `</`, not `<`.
+const DSML_TOOL_CALLS_OPEN: &str = "<\u{ff5c}DSML\u{ff5c}tool_calls";
 const DSML_TOOL_CALLS_CLOSE: &str = "</\u{ff5c}DSML\u{ff5c}tool_calls>";
 const DSML_INVOKE_OPEN: &str = "<\u{ff5c}DSML\u{ff5c}invoke ";
 const DSML_INVOKE_CLOSE: &str = "</\u{ff5c}DSML\u{ff5c}invoke>";
@@ -1919,6 +1925,40 @@ Let me search for the function.
     #[test]
     fn translate_dsml_returns_none_for_plain_text() {
         assert!(translate_dsml_tool_calls("just regular text", "id").is_none());
+    }
+
+    #[test]
+    fn translate_dsml_handles_opener_without_trailing_gt() {
+        // Real shape from DeepSeek-V4 in vllm runs: outer opener has no `>`,
+        // just a newline. Inner tags and closer still use `>`. Without this
+        // tolerance, the translator misses 99% of vllm sessions and the agent
+        // produces zero tool calls.
+        let text = "Let me start by searching for the relevant code.\n\n\
+<\u{ff5c}DSML\u{ff5c}tool_calls\n\
+<\u{ff5c}DSML\u{ff5c}invoke name=\"read_file\">\n\
+<\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">/testbed/django/db/models/manager.py</\u{ff5c}DSML\u{ff5c}parameter>\n\
+</\u{ff5c}DSML\u{ff5c}invoke>\n\
+</\u{ff5c}DSML\u{ff5c}tool_calls>";
+        let parsed = translate_dsml_tool_calls(text, "id").expect("DSML extraction");
+        assert_eq!(parsed.tool_uses.len(), 1);
+        assert_eq!(parsed.tool_uses[0].name, "read_file");
+        assert_eq!(
+            parsed.tool_uses[0].input.get("path"),
+            Some(&Value::String("/testbed/django/db/models/manager.py".into())),
+        );
+        assert_eq!(parsed.cleaned_text.trim(), "Let me start by searching for the relevant code.");
+    }
+
+    #[test]
+    fn translate_dsml_handles_opener_with_trailing_gt() {
+        // Old shape (kept working). Some upstream tool-call parsers normalize
+        // the opener with `>`; our match must accept both.
+        let text = "<\u{ff5c}DSML\u{ff5c}tool_calls>\
+<\u{ff5c}DSML\u{ff5c}invoke name=\"x\"></\u{ff5c}DSML\u{ff5c}invoke>\
+</\u{ff5c}DSML\u{ff5c}tool_calls>";
+        let parsed = translate_dsml_tool_calls(text, "id").expect("DSML extraction");
+        assert_eq!(parsed.tool_uses.len(), 1);
+        assert_eq!(parsed.tool_uses[0].name, "x");
     }
 
     #[test]
