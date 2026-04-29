@@ -1073,6 +1073,23 @@ pub fn build_chat_completion_request(
         payload["thinking"] = serde_json::to_value(thinking).unwrap_or_default();
     }
 
+    // Forward `chat_template_kwargs` to the wire when the caller provides them
+    // via env vars. Server-side reasoning toggles for DeepSeek-V4
+    // (`{"thinking": true}` or `{"thinking_mode": "thinking"}`) and any other
+    // OpenAI-compat backend that consumes chat_template_kwargs flow through
+    // here unchanged. claw-code is the agent making the request; nemo-skills'
+    // `inference.extra_body` doesn't reach this layer, so we read env vars
+    // that callers can populate at job-launch time.
+    //
+    // Recognized env vars (any combination, last-write wins on overlap):
+    //   CLAW_CHAT_TEMPLATE_KWARGS_THINKING       — "true"/"false"/"1"/"0"
+    //   CLAW_CHAT_TEMPLATE_KWARGS_THINKING_MODE  — "thinking"/"chat"/...
+    //   CLAW_CHAT_TEMPLATE_KWARGS                — raw JSON, replaces any partial
+    //                                              kwargs assembled from above
+    if let Some(kwargs) = collect_chat_template_kwargs_from_env() {
+        payload["chat_template_kwargs"] = kwargs;
+    }
+
     // parallel_tool_calls: when set, the model may emit multiple tool_calls per response.
     // vLLM, OpenAI, and OpenAI-compatible providers honor this at the request level.
     if let Some(parallel) = request.parallel_tool_calls {
@@ -1782,6 +1799,52 @@ fn parse_dsml_value(raw: &str, is_string: bool) -> Value {
         }
     }
     Value::String(raw.to_string())
+}
+
+/// Read `chat_template_kwargs` from job-launch env vars. Returns None if no
+/// recognized variable is set; otherwise returns a JSON object ready to drop
+/// into the request payload.
+fn collect_chat_template_kwargs_from_env() -> Option<Value> {
+    let mut kwargs = serde_json::Map::new();
+    if let Ok(raw) = std::env::var("CLAW_CHAT_TEMPLATE_KWARGS_THINKING") {
+        if let Some(b) = parse_env_bool(&raw) {
+            kwargs.insert("thinking".to_string(), Value::Bool(b));
+        }
+    }
+    if let Ok(raw) = std::env::var("CLAW_CHAT_TEMPLATE_KWARGS_THINKING_MODE") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            kwargs.insert(
+                "thinking_mode".to_string(),
+                Value::String(trimmed.to_string()),
+            );
+        }
+    }
+    // Raw JSON env var wins if present — lets callers express any shape.
+    if let Ok(raw) = std::env::var("CLAW_CHAT_TEMPLATE_KWARGS") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                if parsed.is_object() {
+                    return Some(parsed);
+                }
+            }
+            // Malformed JSON: ignore silently rather than break the request.
+        }
+    }
+    if kwargs.is_empty() {
+        None
+    } else {
+        Some(Value::Object(kwargs))
+    }
+}
+
+fn parse_env_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 fn dsml_looks_like_bare_literal(s: &str) -> bool {
@@ -2534,6 +2597,133 @@ Let me search for the function.
             .expect("assistant message with tool calls must include tool_calls field");
         assert!(tool_calls.is_array());
         assert_eq!(tool_calls.as_array().unwrap().len(), 1);
+    }
+
+    /// `CLAW_CHAT_TEMPLATE_KWARGS_THINKING=true` (set at job-launch time) must
+    /// appear in the request body as `chat_template_kwargs: {thinking: true}`.
+    /// Server-side this triggers the thinking phase for DeepSeek-V4 (sglang
+    /// `encoding_dsv4` reads exactly this field).
+    #[test]
+    fn build_request_forwards_chat_template_kwargs_thinking_env() {
+        use crate::types::{InputContentBlock, InputMessage};
+        let _g = env_lock();
+        std::env::remove_var("CLAW_CHAT_TEMPLATE_KWARGS");
+        std::env::remove_var("CLAW_CHAT_TEMPLATE_KWARGS_THINKING_MODE");
+        std::env::set_var("CLAW_CHAT_TEMPLATE_KWARGS_THINKING", "true");
+
+        let request = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::Text { text: "hi".to_string() }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(
+            payload["chat_template_kwargs"],
+            json!({"thinking": true})
+        );
+
+        std::env::remove_var("CLAW_CHAT_TEMPLATE_KWARGS_THINKING");
+    }
+
+    /// `CLAW_CHAT_TEMPLATE_KWARGS_THINKING_MODE=thinking` is the alternate
+    /// spelling some encoders use (encoding_dsv4's underlying parameter name).
+    /// Both must work and they can be combined.
+    #[test]
+    fn build_request_forwards_thinking_mode_env_and_combinations() {
+        use crate::types::{InputContentBlock, InputMessage};
+        let _g = env_lock();
+        std::env::remove_var("CLAW_CHAT_TEMPLATE_KWARGS");
+        std::env::set_var("CLAW_CHAT_TEMPLATE_KWARGS_THINKING", "1");
+        std::env::set_var("CLAW_CHAT_TEMPLATE_KWARGS_THINKING_MODE", "thinking");
+
+        let request = MessageRequest {
+            model: "any-model".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::Text { text: "hi".to_string() }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let kwargs = payload.get("chat_template_kwargs").expect("kwargs missing");
+        assert_eq!(kwargs.get("thinking"), Some(&Value::Bool(true)));
+        assert_eq!(
+            kwargs.get("thinking_mode"),
+            Some(&Value::String("thinking".to_string()))
+        );
+
+        std::env::remove_var("CLAW_CHAT_TEMPLATE_KWARGS_THINKING");
+        std::env::remove_var("CLAW_CHAT_TEMPLATE_KWARGS_THINKING_MODE");
+    }
+
+    /// Without any of the three env vars set, no `chat_template_kwargs` field
+    /// is added — keeps the request body clean for OpenAI/Kimi/etc.
+    #[test]
+    fn build_request_omits_chat_template_kwargs_when_no_env_set() {
+        use crate::types::{InputContentBlock, InputMessage};
+        let _g = env_lock();
+        std::env::remove_var("CLAW_CHAT_TEMPLATE_KWARGS");
+        std::env::remove_var("CLAW_CHAT_TEMPLATE_KWARGS_THINKING");
+        std::env::remove_var("CLAW_CHAT_TEMPLATE_KWARGS_THINKING_MODE");
+
+        for model in &["deepseek-v4-flash", "gpt-4o", "kimi-k2", "qwen3-30b"] {
+            let request = MessageRequest {
+                model: (*model).to_string(),
+                max_tokens: 100,
+                messages: vec![InputMessage {
+                    role: "user".to_string(),
+                    content: vec![InputContentBlock::Text { text: "hi".to_string() }],
+                }],
+                stream: false,
+                ..Default::default()
+            };
+            let payload =
+                build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+            assert!(
+                payload.get("chat_template_kwargs").is_none(),
+                "model {model} must omit chat_template_kwargs when no env var is set"
+            );
+        }
+    }
+
+    /// `CLAW_CHAT_TEMPLATE_KWARGS='{"thinking":true,"reasoning_effort":"max"}'`
+    /// passes the entire object through verbatim (escape hatch for callers
+    /// who need richer kwargs than the two scalar env vars cover).
+    #[test]
+    fn build_request_forwards_raw_json_env_unchanged() {
+        use crate::types::{InputContentBlock, InputMessage};
+        let _g = env_lock();
+        std::env::remove_var("CLAW_CHAT_TEMPLATE_KWARGS_THINKING");
+        std::env::remove_var("CLAW_CHAT_TEMPLATE_KWARGS_THINKING_MODE");
+        std::env::set_var(
+            "CLAW_CHAT_TEMPLATE_KWARGS",
+            r#"{"thinking": true, "reasoning_effort": "max"}"#,
+        );
+
+        let request = MessageRequest {
+            model: "any-model".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::Text { text: "hi".to_string() }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(
+            payload["chat_template_kwargs"],
+            json!({"thinking": true, "reasoning_effort": "max"})
+        );
+
+        std::env::remove_var("CLAW_CHAT_TEMPLATE_KWARGS");
     }
 
     /// Orphaned tool messages (no preceding assistant `tool_calls`) must be
