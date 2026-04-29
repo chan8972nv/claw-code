@@ -456,10 +456,16 @@ struct StreamState {
     stop_reason: Option<String>,
     usage: Option<Usage>,
     tool_calls: BTreeMap<u32, ToolCallState>,
+    /// Buffer text deltas instead of emitting them when the model uses DSML
+    /// markup; the markup spans multiple chunks and must be parsed whole.
+    dsml_mode: bool,
+    dsml_text_buffer: String,
+    dsml_message_id: String,
 }
 
 impl StreamState {
     fn new(model: String) -> Self {
+        let dsml_mode = model_emits_dsml_tool_calls(&model);
         Self {
             model,
             message_started: false,
@@ -469,6 +475,9 @@ impl StreamState {
             stop_reason: None,
             usage: None,
             tool_calls: BTreeMap::new(),
+            dsml_mode,
+            dsml_text_buffer: String::new(),
+            dsml_message_id: String::new(),
         }
     }
 
@@ -476,6 +485,7 @@ impl StreamState {
         let mut events = Vec::new();
         if !self.message_started {
             self.message_started = true;
+            self.dsml_message_id = chunk.id.clone();
             events.push(StreamEvent::MessageStart(MessageStartEvent {
                 message: MessageResponse {
                     id: chunk.id.clone(),
@@ -507,19 +517,26 @@ impl StreamState {
 
         for choice in chunk.choices {
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
-                if !self.text_started {
-                    self.text_started = true;
-                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                if self.dsml_mode {
+                    // Hold all text until finish; we cannot detect partial DSML
+                    // markup mid-chunk, and emitting raw deltas would expose the
+                    // special tokens to the agent loop.
+                    self.dsml_text_buffer.push_str(&content);
+                } else {
+                    if !self.text_started {
+                        self.text_started = true;
+                        events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                            index: 0,
+                            content_block: OutputContentBlock::Text {
+                                text: String::new(),
+                            },
+                        }));
+                    }
+                    events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                         index: 0,
-                        content_block: OutputContentBlock::Text {
-                            text: String::new(),
-                        },
+                        delta: ContentBlockDelta::TextDelta { text: content },
                     }));
                 }
-                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
-                    delta: ContentBlockDelta::TextDelta { text: content },
-                }));
             }
 
             for tool_call in choice.delta.tool_calls {
@@ -577,6 +594,63 @@ impl StreamState {
             }));
         }
 
+        // DSML mode: flush the buffered text now, parsing tool calls out of it
+        // and synthesizing the equivalent ContentBlock events. Block indices
+        // start at 0 here because we deliberately suppressed any text events
+        // during streaming.
+        let mut dsml_next_index = 0u32;
+        let mut dsml_extracted_tool_uses = false;
+        if self.dsml_mode && !self.dsml_text_buffer.is_empty() {
+            let id_prefix = format!("toolu_dsml_{}", self.dsml_message_id);
+            let buffer = std::mem::take(&mut self.dsml_text_buffer);
+            let (cleaned_text, tool_uses) = match translate_dsml_tool_calls(&buffer, &id_prefix) {
+                Some(parsed) => (parsed.cleaned_text, parsed.tool_uses),
+                None => (buffer, Vec::new()),
+            };
+            let trimmed = cleaned_text.trim();
+            if !trimmed.is_empty() {
+                events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                    index: dsml_next_index,
+                    content_block: OutputContentBlock::Text {
+                        text: String::new(),
+                    },
+                }));
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: dsml_next_index,
+                    delta: ContentBlockDelta::TextDelta {
+                        text: trimmed.to_string(),
+                    },
+                }));
+                events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                    index: dsml_next_index,
+                }));
+                dsml_next_index += 1;
+            }
+            for tool_use in tool_uses {
+                dsml_extracted_tool_uses = true;
+                events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                    index: dsml_next_index,
+                    content_block: OutputContentBlock::ToolUse {
+                        id: tool_use.id,
+                        name: tool_use.name,
+                        input: json!({}),
+                    },
+                }));
+                let json_str =
+                    serde_json::to_string(&tool_use.input).unwrap_or_else(|_| "{}".to_string());
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: dsml_next_index,
+                    delta: ContentBlockDelta::InputJsonDelta {
+                        partial_json: json_str,
+                    },
+                }));
+                events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                    index: dsml_next_index,
+                }));
+                dsml_next_index += 1;
+            }
+        }
+
         for state in self.tool_calls.values_mut() {
             if !state.started {
                 if let Some(start_event) = state.start_event()? {
@@ -596,13 +670,24 @@ impl StreamState {
         }
 
         if self.message_started {
+            // sglang emits finish_reason="stop" when DSML markers are part of
+            // the text content; once we've synthesized tool_use blocks the
+            // agent loop must continue, so override end_turn → tool_use.
+            let final_stop_reason = if dsml_extracted_tool_uses
+                && self
+                    .stop_reason
+                    .as_deref()
+                    .is_none_or(|reason| reason == "end_turn" || reason == "stop")
+            {
+                "tool_use".to_string()
+            } else {
+                self.stop_reason
+                    .clone()
+                    .unwrap_or_else(|| "end_turn".to_string())
+            };
             events.push(StreamEvent::MessageDelta(MessageDeltaEvent {
                 delta: MessageDelta {
-                    stop_reason: Some(
-                        self.stop_reason
-                            .clone()
-                            .unwrap_or_else(|| "end_turn".to_string()),
-                    ),
+                    stop_reason: Some(final_stop_reason),
                     stop_sequence: None,
                 },
                 usage: self.usage.clone().unwrap_or(Usage {
@@ -1206,8 +1291,32 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
+    let mut dsml_tool_use_count = 0usize;
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
-        content.push(OutputContentBlock::Text { text });
+        let parsed = if model_emits_dsml_tool_calls(model) {
+            translate_dsml_tool_calls(&text, &format!("toolu_dsml_{}", response.id))
+        } else {
+            None
+        };
+        match parsed {
+            Some(parsed) => {
+                let trimmed = parsed.cleaned_text.trim();
+                if !trimmed.is_empty() {
+                    content.push(OutputContentBlock::Text {
+                        text: trimmed.to_string(),
+                    });
+                }
+                dsml_tool_use_count = parsed.tool_uses.len();
+                for tool_use in parsed.tool_uses {
+                    content.push(OutputContentBlock::ToolUse {
+                        id: tool_use.id,
+                        name: tool_use.name,
+                        input: tool_use.input,
+                    });
+                }
+            }
+            None => content.push(OutputContentBlock::Text { text }),
+        }
     }
     for tool_call in choice.message.tool_calls {
         content.push(OutputContentBlock::ToolUse {
@@ -1217,15 +1326,25 @@ fn normalize_response(
         });
     }
 
+    let stop_reason = match choice.finish_reason {
+        // If DSML tool calls were extracted, signal tool_use so the agent loop
+        // dispatches them — sglang's native finish_reason is "stop" when the
+        // tool calls are emitted as in-band special tokens.
+        Some(reason) if dsml_tool_use_count > 0 && reason == "stop" => {
+            Some("tool_use".to_string())
+        }
+        Some(reason) => Some(normalize_finish_reason(&reason)),
+        None if dsml_tool_use_count > 0 => Some("tool_use".to_string()),
+        None => None,
+    };
+
     Ok(MessageResponse {
         id: response.id,
         kind: "message".to_string(),
         role: choice.message.role,
         content,
         model: response.model.if_empty_then(model.to_string()),
-        stop_reason: choice
-            .finish_reason
-            .map(|value| normalize_finish_reason(&value)),
+        stop_reason,
         stop_sequence: None,
         usage: Usage {
             input_tokens: response
@@ -1435,20 +1554,260 @@ impl StringExt for String {
     }
 }
 
+// DeepSeek's native tool-call markup uses U+FF5C (full-width vertical bar) as a
+// boundary token — these are special tokens the model emits regardless of any
+// system-prompt instruction to use Anthropic-style XML. The harness expects
+// structured tool calls in the OpenAI response, so we translate the markup to
+// `OutputContentBlock::ToolUse` blocks before the harness sees the text.
+//
+//   <｜DSML｜tool_calls>
+//     <｜DSML｜invoke name="grep_search">
+//       <｜DSML｜parameter name="pattern" string="true">def foo</｜DSML｜parameter>
+//       <｜DSML｜parameter name="-n" string="false">true</｜DSML｜parameter>
+//     </｜DSML｜invoke>
+//   </｜DSML｜tool_calls>
+//
+// `string="false"` signals the parameter value should be parsed as a JSON
+// literal (true/false/number/array/object/null); otherwise it's a plain string.
+const DSML_TOOL_CALLS_OPEN: &str = "<\u{ff5c}DSML\u{ff5c}tool_calls>";
+const DSML_TOOL_CALLS_CLOSE: &str = "</\u{ff5c}DSML\u{ff5c}tool_calls>";
+const DSML_INVOKE_OPEN: &str = "<\u{ff5c}DSML\u{ff5c}invoke ";
+const DSML_INVOKE_CLOSE: &str = "</\u{ff5c}DSML\u{ff5c}invoke>";
+const DSML_PARAMETER_OPEN: &str = "<\u{ff5c}DSML\u{ff5c}parameter ";
+const DSML_PARAMETER_CLOSE: &str = "</\u{ff5c}DSML\u{ff5c}parameter>";
+
+fn model_emits_dsml_tool_calls(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
+    canonical.starts_with("deepseek-v4")
+        || canonical.starts_with("deepseek_v4")
+        || canonical.starts_with("deepseek-v3.2")
+        || canonical.starts_with("deepseek_v3.2")
+}
+
+#[derive(Debug)]
+struct DsmlToolUse {
+    id: String,
+    name: String,
+    input: Value,
+}
+
+#[derive(Debug)]
+struct ParsedDsml {
+    cleaned_text: String,
+    tool_uses: Vec<DsmlToolUse>,
+}
+
+fn translate_dsml_tool_calls(text: &str, id_prefix: &str) -> Option<ParsedDsml> {
+    if !text.contains(DSML_TOOL_CALLS_OPEN) {
+        return None;
+    }
+    let mut cleaned_text = String::with_capacity(text.len());
+    let mut tool_uses = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = text[cursor..].find(DSML_TOOL_CALLS_OPEN) {
+        let abs_start = cursor + rel_start;
+        cleaned_text.push_str(&text[cursor..abs_start]);
+        let after_open = abs_start + DSML_TOOL_CALLS_OPEN.len();
+        let Some(rel_close) = text[after_open..].find(DSML_TOOL_CALLS_CLOSE) else {
+            // Unterminated block — preserve verbatim and stop scanning so we
+            // don't accidentally drop content the model intended to emit.
+            cleaned_text.push_str(&text[abs_start..]);
+            cursor = text.len();
+            break;
+        };
+        let abs_close = after_open + rel_close;
+        let inner = &text[after_open..abs_close];
+        parse_dsml_invokes(inner, id_prefix, &mut tool_uses);
+        cursor = abs_close + DSML_TOOL_CALLS_CLOSE.len();
+    }
+    cleaned_text.push_str(&text[cursor..]);
+
+    if tool_uses.is_empty() {
+        // Saw an opener but extracted nothing; treat as raw text so we don't
+        // silently lose content.
+        return None;
+    }
+    Some(ParsedDsml {
+        cleaned_text,
+        tool_uses,
+    })
+}
+
+fn parse_dsml_invokes(inner: &str, id_prefix: &str, tool_uses: &mut Vec<DsmlToolUse>) {
+    let mut pos = 0usize;
+    while let Some(rel) = inner[pos..].find(DSML_INVOKE_OPEN) {
+        let invoke_start = pos + rel;
+        let after_kw = invoke_start + DSML_INVOKE_OPEN.len();
+        let Some(rel_gt) = inner[after_kw..].find('>') else {
+            return;
+        };
+        let attr_str = &inner[after_kw..after_kw + rel_gt];
+        let body_start = after_kw + rel_gt + 1;
+        let Some(rel_close) = inner[body_start..].find(DSML_INVOKE_CLOSE) else {
+            return;
+        };
+        let body = &inner[body_start..body_start + rel_close];
+        let name = extract_dsml_attr(attr_str, "name").unwrap_or_default();
+        if !name.is_empty() {
+            let params = parse_dsml_parameters(body);
+            tool_uses.push(DsmlToolUse {
+                id: format!("{}_{}", id_prefix, tool_uses.len()),
+                name,
+                input: Value::Object(params),
+            });
+        }
+        pos = body_start + rel_close + DSML_INVOKE_CLOSE.len();
+    }
+}
+
+fn parse_dsml_parameters(body: &str) -> serde_json::Map<String, Value> {
+    let mut map = serde_json::Map::new();
+    let mut pos = 0usize;
+    while let Some(rel) = body[pos..].find(DSML_PARAMETER_OPEN) {
+        let p_start = pos + rel;
+        let after_kw = p_start + DSML_PARAMETER_OPEN.len();
+        let Some(rel_gt) = body[after_kw..].find('>') else {
+            return map;
+        };
+        let attr_str = &body[after_kw..after_kw + rel_gt];
+        let value_start = after_kw + rel_gt + 1;
+        let Some(rel_close) = body[value_start..].find(DSML_PARAMETER_CLOSE) else {
+            return map;
+        };
+        let value_str = &body[value_start..value_start + rel_close];
+        let name = extract_dsml_attr(attr_str, "name").unwrap_or_default();
+        if !name.is_empty() {
+            let is_string = extract_dsml_attr(attr_str, "string")
+                .map_or(true, |v| !v.eq_ignore_ascii_case("false"));
+            let value = if is_string {
+                Value::String(value_str.to_string())
+            } else {
+                serde_json::from_str::<Value>(value_str.trim())
+                    .unwrap_or_else(|_| Value::String(value_str.to_string()))
+            };
+            map.insert(name, value);
+        }
+        pos = value_start + rel_close + DSML_PARAMETER_CLOSE.len();
+    }
+    map
+}
+
+fn extract_dsml_attr(attrs: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=\"");
+    let start = attrs.find(&needle)? + needle.len();
+    let rest = &attrs[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig,
+        model_emits_dsml_tool_calls, normalize_finish_reason, openai_tool_choice,
+        parse_tool_arguments, translate_dsml_tool_calls, OpenAiCompatClient, OpenAiCompatConfig,
     };
     use crate::error::ApiError;
     use crate::types::{
         InputContentBlock, InputMessage, MessageRequest, ToolChoice, ToolDefinition,
         ToolResultContentBlock,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn model_emits_dsml_tool_calls_detects_deepseek_v4() {
+        assert!(model_emits_dsml_tool_calls("deepseek-v4-flash"));
+        assert!(model_emits_dsml_tool_calls("deepseek_v4"));
+        assert!(model_emits_dsml_tool_calls("DeepSeek-V4-Flash"));
+        assert!(model_emits_dsml_tool_calls(
+            "/lustre/.../checkpoints/DeepSeek-V4-Flash"
+        ));
+        assert!(model_emits_dsml_tool_calls("deepseek-v3.2-exp"));
+        assert!(!model_emits_dsml_tool_calls("deepseek-v3"));
+        assert!(!model_emits_dsml_tool_calls("gpt-4o"));
+        assert!(!model_emits_dsml_tool_calls("kimi-k2"));
+    }
+
+    #[test]
+    fn translate_dsml_extracts_single_tool_call_with_string_param() {
+        let text = "\
+Let me search for the function.
+
+<\u{ff5c}DSML\u{ff5c}tool_calls>
+<\u{ff5c}DSML\u{ff5c}invoke name=\"grep_search\">
+<\u{ff5c}DSML\u{ff5c}parameter name=\"pattern\" string=\"true\">def separability_matrix</\u{ff5c}DSML\u{ff5c}parameter>
+</\u{ff5c}DSML\u{ff5c}invoke>
+</\u{ff5c}DSML\u{ff5c}tool_calls>";
+        let parsed = translate_dsml_tool_calls(text, "id").expect("DSML extraction");
+        assert_eq!(parsed.tool_uses.len(), 1);
+        assert_eq!(parsed.tool_uses[0].name, "grep_search");
+        assert_eq!(parsed.tool_uses[0].id, "id_0");
+        assert_eq!(
+            parsed.tool_uses[0].input,
+            json!({"pattern": "def separability_matrix"})
+        );
+        assert!(parsed.cleaned_text.contains("Let me search"));
+        assert!(!parsed.cleaned_text.contains("DSML"));
+    }
+
+    #[test]
+    fn translate_dsml_parses_non_string_param_as_json() {
+        let text = "<\u{ff5c}DSML\u{ff5c}tool_calls>\
+<\u{ff5c}DSML\u{ff5c}invoke name=\"grep_search\">\
+<\u{ff5c}DSML\u{ff5c}parameter name=\"pattern\" string=\"true\">x</\u{ff5c}DSML\u{ff5c}parameter>\
+<\u{ff5c}DSML\u{ff5c}parameter name=\"-n\" string=\"false\">true</\u{ff5c}DSML\u{ff5c}parameter>\
+<\u{ff5c}DSML\u{ff5c}parameter name=\"limit\" string=\"false\">42</\u{ff5c}DSML\u{ff5c}parameter>\
+</\u{ff5c}DSML\u{ff5c}invoke></\u{ff5c}DSML\u{ff5c}tool_calls>";
+        let parsed = translate_dsml_tool_calls(text, "id").expect("DSML extraction");
+        let input = &parsed.tool_uses[0].input;
+        assert_eq!(input.get("pattern"), Some(&Value::String("x".into())));
+        assert_eq!(input.get("-n"), Some(&Value::Bool(true)));
+        assert_eq!(
+            input.get("limit"),
+            Some(&Value::Number(serde_json::Number::from(42))),
+        );
+    }
+
+    #[test]
+    fn translate_dsml_extracts_multiple_invokes_in_one_block() {
+        let text = "\
+<\u{ff5c}DSML\u{ff5c}tool_calls>\
+<\u{ff5c}DSML\u{ff5c}invoke name=\"a\"><\u{ff5c}DSML\u{ff5c}parameter name=\"x\" string=\"true\">1</\u{ff5c}DSML\u{ff5c}parameter></\u{ff5c}DSML\u{ff5c}invoke>\
+<\u{ff5c}DSML\u{ff5c}invoke name=\"b\"><\u{ff5c}DSML\u{ff5c}parameter name=\"y\" string=\"true\">2</\u{ff5c}DSML\u{ff5c}parameter></\u{ff5c}DSML\u{ff5c}invoke>\
+</\u{ff5c}DSML\u{ff5c}tool_calls>";
+        let parsed = translate_dsml_tool_calls(text, "id").expect("DSML extraction");
+        assert_eq!(parsed.tool_uses.len(), 2);
+        assert_eq!(parsed.tool_uses[0].name, "a");
+        assert_eq!(parsed.tool_uses[0].id, "id_0");
+        assert_eq!(parsed.tool_uses[1].name, "b");
+        assert_eq!(parsed.tool_uses[1].id, "id_1");
+    }
+
+    #[test]
+    fn translate_dsml_returns_none_for_plain_text() {
+        assert!(translate_dsml_tool_calls("just regular text", "id").is_none());
+    }
+
+    #[test]
+    fn translate_dsml_returns_none_for_empty_block() {
+        // Opener with no invokes — preserve text rather than silently dropping.
+        let text =
+            "<\u{ff5c}DSML\u{ff5c}tool_calls></\u{ff5c}DSML\u{ff5c}tool_calls>";
+        assert!(translate_dsml_tool_calls(text, "id").is_none());
+    }
+
+    #[test]
+    fn translate_dsml_preserves_text_around_block() {
+        let text = "before <\u{ff5c}DSML\u{ff5c}tool_calls>\
+<\u{ff5c}DSML\u{ff5c}invoke name=\"a\"></\u{ff5c}DSML\u{ff5c}invoke>\
+</\u{ff5c}DSML\u{ff5c}tool_calls> after";
+        let parsed = translate_dsml_tool_calls(text, "id").expect("DSML extraction");
+        assert_eq!(parsed.cleaned_text, "before  after");
+    }
+
 
     #[test]
     fn request_translation_uses_openai_compatible_shape() {
