@@ -551,10 +551,21 @@ impl StreamState {
                         continue;
                     }
                 }
-                if let Some(delta_event) = state.delta_event() {
-                    events.push(StreamEvent::ContentBlockDelta(delta_event));
+                // For DSML-emitting models we can't emit args incrementally
+                // because we need the complete JSON before applying bare-keyword
+                // coercion. Buffer the deltas and emit one coerced delta at
+                // tool_call finish time instead.
+                if !self.dsml_mode {
+                    if let Some(delta_event) = state.delta_event() {
+                        events.push(StreamEvent::ContentBlockDelta(delta_event));
+                    }
                 }
                 if choice.finish_reason.as_deref() == Some("tool_calls") && !state.stopped {
+                    if self.dsml_mode {
+                        if let Some(coerced) = state.coerced_delta_event() {
+                            events.push(StreamEvent::ContentBlockDelta(coerced));
+                        }
+                    }
                     state.stopped = true;
                     events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
                         index: block_index,
@@ -567,6 +578,11 @@ impl StreamState {
                 if finish_reason == "tool_calls" {
                     for state in self.tool_calls.values_mut() {
                         if state.started && !state.stopped {
+                            if self.dsml_mode {
+                                if let Some(coerced) = state.coerced_delta_event() {
+                                    events.push(StreamEvent::ContentBlockDelta(coerced));
+                                }
+                            }
                             state.stopped = true;
                             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
                                 index: state.block_index(),
@@ -656,9 +672,20 @@ impl StreamState {
                 if let Some(start_event) = state.start_event()? {
                     state.started = true;
                     events.push(StreamEvent::ContentBlockStart(start_event));
-                    if let Some(delta_event) = state.delta_event() {
+                    let delta = if self.dsml_mode {
+                        state.coerced_delta_event()
+                    } else {
+                        state.delta_event()
+                    };
+                    if let Some(delta_event) = delta {
                         events.push(StreamEvent::ContentBlockDelta(delta_event));
                     }
+                }
+            } else if self.dsml_mode {
+                // Tool call started during streaming with deltas suppressed —
+                // emit the coerced full-args delta now, before Stop.
+                if let Some(delta_event) = state.coerced_delta_event() {
+                    events.push(StreamEvent::ContentBlockDelta(delta_event));
                 }
             }
             if state.started && !state.stopped {
@@ -761,6 +788,26 @@ impl ToolCallState {
             index: self.block_index(),
             delta: ContentBlockDelta::InputJsonDelta {
                 partial_json: delta,
+            },
+        })
+    }
+
+    /// For DSML-emitting models: emit one delta carrying the complete args
+    /// after coercing string-quoted bare keywords/numbers to JSON literals.
+    /// Returns None if no args have been buffered yet.
+    fn coerced_delta_event(&mut self) -> Option<ContentBlockDeltaEvent> {
+        if self.arguments.is_empty() {
+            return None;
+        }
+        let mut value = serde_json::from_str::<Value>(&self.arguments)
+            .unwrap_or_else(|_| json!({ "raw": self.arguments.clone() }));
+        coerce_dsml_arg_strings(&mut value);
+        let json_str = serde_json::to_string(&value).unwrap_or_else(|_| self.arguments.clone());
+        self.emitted_len = self.arguments.len();
+        Some(ContentBlockDeltaEvent {
+            index: self.block_index(),
+            delta: ContentBlockDelta::InputJsonDelta {
+                partial_json: json_str,
             },
         })
     }
@@ -1318,11 +1365,21 @@ fn normalize_response(
             None => content.push(OutputContentBlock::Text { text }),
         }
     }
+    let dsml_model = model_emits_dsml_tool_calls(model);
     for tool_call in choice.message.tool_calls {
+        let mut input = parse_tool_arguments(&tool_call.function.arguments);
+        if dsml_model {
+            // sglang's --tool-call-parser deepseekv32 path: DSML markup was
+            // converted to OpenAI tool_calls server-side, but bare keywords
+            // (`true`/`false`/`null`/numbers) come through quoted as strings.
+            // Apply the same coercion we do in the DSML-text path so typed
+            // tool params accept them.
+            coerce_dsml_arg_strings(&mut input);
+        }
         content.push(OutputContentBlock::ToolUse {
             id: tool_call.id,
             name: tool_call.function.name,
-            input: parse_tool_arguments(&tool_call.function.arguments),
+            input,
         });
     }
 
@@ -1727,6 +1784,37 @@ fn dsml_looks_like_bare_literal(s: &str) -> bool {
         || s.parse::<f64>().is_ok()
 }
 
+/// Walk a parsed JSON value and coerce any string that's a bare JSON literal
+/// (`"true"`/`"false"`/`"null"`/`"42"`) into the actual literal. Used on
+/// args that arrived via sglang's `--tool-call-parser deepseekv32` path,
+/// where DSML markup gets converted to OpenAI tool_calls server-side but
+/// bare keywords are preserved as quoted strings.
+fn coerce_dsml_arg_strings(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for v in map.values_mut() {
+                coerce_dsml_arg_strings(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                coerce_dsml_arg_strings(v);
+            }
+        }
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if dsml_looks_like_bare_literal(trimmed) {
+                if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                    if !matches!(parsed, Value::String(_)) {
+                        *value = parsed;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1822,6 +1910,42 @@ Let me search for the function.
         let text =
             "<\u{ff5c}DSML\u{ff5c}tool_calls></\u{ff5c}DSML\u{ff5c}tool_calls>";
         assert!(translate_dsml_tool_calls(text, "id").is_none());
+    }
+
+    #[test]
+    fn coerce_dsml_arg_strings_converts_bare_keywords_in_objects() {
+        // sglang's --tool-call-parser deepseekv32 path: DSML markup converted
+        // server-side, bare keywords arrive as quoted strings.
+        use super::coerce_dsml_arg_strings;
+        let mut v: Value = serde_json::from_str(
+            r#"{"-n": "true", "limit": "42", "pattern": "def foo", "path": "/a/b.py", "skip": "false", "info": "null"}"#,
+        )
+        .unwrap();
+        coerce_dsml_arg_strings(&mut v);
+        assert_eq!(v.get("-n"), Some(&Value::Bool(true)));
+        assert_eq!(v.get("skip"), Some(&Value::Bool(false)));
+        assert_eq!(v.get("info"), Some(&Value::Null));
+        assert_eq!(
+            v.get("limit"),
+            Some(&Value::Number(serde_json::Number::from(42))),
+        );
+        assert_eq!(v.get("pattern"), Some(&Value::String("def foo".into())));
+        assert_eq!(v.get("path"), Some(&Value::String("/a/b.py".into())));
+    }
+
+    #[test]
+    fn coerce_dsml_arg_strings_recurses_into_arrays_and_nested_objects() {
+        use super::coerce_dsml_arg_strings;
+        let mut v: Value = serde_json::from_str(
+            r#"{"opts": {"-v": "true", "n": "5"}, "flags": ["true", "false", "keep"]}"#,
+        )
+        .unwrap();
+        coerce_dsml_arg_strings(&mut v);
+        assert_eq!(v["opts"]["-v"], Value::Bool(true));
+        assert_eq!(v["opts"]["n"], Value::Number(serde_json::Number::from(5)));
+        assert_eq!(v["flags"][0], Value::Bool(true));
+        assert_eq!(v["flags"][1], Value::Bool(false));
+        assert_eq!(v["flags"][2], Value::String("keep".into()));
     }
 
     #[test]
