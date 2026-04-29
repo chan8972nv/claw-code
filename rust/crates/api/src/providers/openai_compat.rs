@@ -1779,9 +1779,26 @@ fn parse_dsml_value(raw: &str, is_string: bool) -> Value {
 }
 
 fn dsml_looks_like_bare_literal(s: &str) -> bool {
-    matches!(s, "true" | "false" | "null")
-        || s.parse::<i64>().is_ok()
-        || s.parse::<f64>().is_ok()
+    if matches!(s, "true" | "false" | "null") {
+        return true;
+    }
+    if s.parse::<i64>().is_ok() {
+        return true;
+    }
+    // JSON arrays and objects: the model frequently sets string="true" on
+    // structured values (e.g. todo lists for the TodoWrite tool). Cheap shape
+    // check first so we don't run a full JSON parse on every string.
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'[' && last == b']') || (first == b'{' && last == b'}') {
+            return true;
+        }
+    }
+    // Floats deliberately excluded — "3.10" would coerce to 3.1 and lose
+    // the trailing zero, breaking version strings and similar.
+    false
 }
 
 /// Walk a parsed JSON value and coerce any string that's a bare JSON literal
@@ -1931,6 +1948,59 @@ Let me search for the function.
         );
         assert_eq!(v.get("pattern"), Some(&Value::String("def foo".into())));
         assert_eq!(v.get("path"), Some(&Value::String("/a/b.py".into())));
+    }
+
+    #[test]
+    fn coerce_dsml_arg_strings_converts_quoted_array_literal() {
+        // Observed in production with the TodoWrite tool: model emits
+        //   string="true">[{...}, {...}]
+        // server delivers it as the *string* `"[{\"content\":...}]"` which the
+        // tool registry rejects with `invalid type: string ... expected a sequence`.
+        use super::coerce_dsml_arg_strings;
+        let mut v: Value = serde_json::from_str(
+            r#"{"todos": "[{\"content\": \"step 1\", \"status\": \"pending\"}, {\"content\": \"step 2\", \"status\": \"pending\"}]"}"#,
+        )
+        .unwrap();
+        coerce_dsml_arg_strings(&mut v);
+        let arr = v.get("todos").and_then(Value::as_array).expect("array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["content"], Value::String("step 1".into()));
+        assert_eq!(arr[0]["status"], Value::String("pending".into()));
+    }
+
+    #[test]
+    fn coerce_dsml_arg_strings_converts_quoted_object_literal() {
+        use super::coerce_dsml_arg_strings;
+        let mut v: Value = serde_json::from_str(r#"{"opts": "{\"-v\": true, \"limit\": 3}"}"#).unwrap();
+        coerce_dsml_arg_strings(&mut v);
+        let obj = v.get("opts").and_then(Value::as_object).expect("object");
+        assert_eq!(obj.get("-v"), Some(&Value::Bool(true)));
+        assert_eq!(obj.get("limit"), Some(&Value::Number(3.into())));
+    }
+
+    #[test]
+    fn coerce_dsml_arg_strings_preserves_float_strings_with_trailing_zero() {
+        // Critical: "3.10" must stay a string. Coercing to 3.1 silently
+        // changes the value (e.g. python_requires=">=3.10" → ">=3.1").
+        use super::coerce_dsml_arg_strings;
+        let mut v: Value = serde_json::from_str(r#"{"version": "3.10", "score": "1.0"}"#).unwrap();
+        coerce_dsml_arg_strings(&mut v);
+        assert_eq!(v.get("version"), Some(&Value::String("3.10".into())));
+        assert_eq!(v.get("score"), Some(&Value::String("1.0".into())));
+    }
+
+    #[test]
+    fn coerce_dsml_arg_strings_does_not_coerce_path_starting_with_brace() {
+        // Edge case: a string that starts with `{` but isn't valid JSON
+        // (e.g., a regex pattern or template). Must remain a string.
+        use super::coerce_dsml_arg_strings;
+        let mut v: Value =
+            serde_json::from_str(r#"{"pattern": "{not valid json"}"#).unwrap();
+        coerce_dsml_arg_strings(&mut v);
+        assert_eq!(
+            v.get("pattern"),
+            Some(&Value::String("{not valid json".into())),
+        );
     }
 
     #[test]
