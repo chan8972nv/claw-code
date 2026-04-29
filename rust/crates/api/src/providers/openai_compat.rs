@@ -1681,12 +1681,7 @@ fn parse_dsml_parameters(body: &str) -> serde_json::Map<String, Value> {
         if !name.is_empty() {
             let is_string = extract_dsml_attr(attr_str, "string")
                 .map_or(true, |v| !v.eq_ignore_ascii_case("false"));
-            let value = if is_string {
-                Value::String(value_str.to_string())
-            } else {
-                serde_json::from_str::<Value>(value_str.trim())
-                    .unwrap_or_else(|_| Value::String(value_str.to_string()))
-            };
+            let value = parse_dsml_value(value_str, is_string);
             map.insert(name, value);
         }
         pos = value_start + rel_close + DSML_PARAMETER_CLOSE.len();
@@ -1700,6 +1695,36 @@ fn extract_dsml_attr(attrs: &str, key: &str) -> Option<String> {
     let rest = &attrs[start..];
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
+}
+
+/// Decide a parameter value from the DSML body and the `string` attribute.
+///
+/// `string="false"` is a clear request for JSON-literal parsing. `string="true"`
+/// (or omitted) requests a string — but DeepSeek-V4 frequently sets `string="true"`
+/// on bare JSON keywords (`true`/`false`/`null`) and numbers, which then arrive
+/// at typed tools as string `"true"` etc. and get rejected. When the value is
+/// unambiguously such a literal we coerce; multi-word strings, paths, patterns,
+/// and anything containing whitespace/special characters stay as strings.
+fn parse_dsml_value(raw: &str, is_string: bool) -> Value {
+    let trimmed = raw.trim();
+    if !is_string {
+        return serde_json::from_str::<Value>(trimmed)
+            .unwrap_or_else(|_| Value::String(raw.to_string()));
+    }
+    if dsml_looks_like_bare_literal(trimmed) {
+        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+            if !matches!(parsed, Value::String(_)) {
+                return parsed;
+            }
+        }
+    }
+    Value::String(raw.to_string())
+}
+
+fn dsml_looks_like_bare_literal(s: &str) -> bool {
+    matches!(s, "true" | "false" | "null")
+        || s.parse::<i64>().is_ok()
+        || s.parse::<f64>().is_ok()
 }
 
 #[cfg(test)]
@@ -1797,6 +1822,35 @@ Let me search for the function.
         let text =
             "<\u{ff5c}DSML\u{ff5c}tool_calls></\u{ff5c}DSML\u{ff5c}tool_calls>";
         assert!(translate_dsml_tool_calls(text, "id").is_none());
+    }
+
+    #[test]
+    fn translate_dsml_coerces_bare_keyword_when_string_true() {
+        // Observed in production: DeepSeek-V4 sets string="true" on bare JSON
+        // keywords. We must coerce, otherwise tool registries that declare
+        // bool params reject `"-n": "true"` and the agent loops on broken
+        // tool calls instead of making progress.
+        let text = "<\u{ff5c}DSML\u{ff5c}tool_calls>\
+<\u{ff5c}DSML\u{ff5c}invoke name=\"grep_search\">\
+<\u{ff5c}DSML\u{ff5c}parameter name=\"-n\" string=\"true\">true</\u{ff5c}DSML\u{ff5c}parameter>\
+<\u{ff5c}DSML\u{ff5c}parameter name=\"limit\" string=\"true\">42</\u{ff5c}DSML\u{ff5c}parameter>\
+<\u{ff5c}DSML\u{ff5c}parameter name=\"pattern\" string=\"true\">def foo</\u{ff5c}DSML\u{ff5c}parameter>\
+<\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">/testbed/django/checks.py</\u{ff5c}DSML\u{ff5c}parameter>\
+</\u{ff5c}DSML\u{ff5c}invoke></\u{ff5c}DSML\u{ff5c}tool_calls>";
+        let parsed = translate_dsml_tool_calls(text, "id").expect("DSML extraction");
+        let input = &parsed.tool_uses[0].input;
+        // Bare keyword/number coerced to JSON literal even with string="true".
+        assert_eq!(input.get("-n"), Some(&Value::Bool(true)));
+        assert_eq!(
+            input.get("limit"),
+            Some(&Value::Number(serde_json::Number::from(42))),
+        );
+        // Multi-word and path-like values stay as strings.
+        assert_eq!(input.get("pattern"), Some(&Value::String("def foo".into())));
+        assert_eq!(
+            input.get("path"),
+            Some(&Value::String("/testbed/django/checks.py".into())),
+        );
     }
 
     #[test]
