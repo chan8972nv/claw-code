@@ -1320,6 +1320,30 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// `ContentBlock::Thinking` round-trips through the session JSON form
+    /// as `{"type": "thinking", "text": "..."}`. Required so reasoning
+    /// persisted in `*.session.json` survives reload and offline analysis.
+    #[test]
+    fn thinking_content_block_round_trips_through_json() {
+        let original = ContentBlock::Thinking {
+            text: "The user wants 2+2. Sum them.".to_string(),
+        };
+        let json = original.to_json();
+        // Verify the wire shape matches what session writers emit.
+        let obj = json.as_object().expect("object");
+        assert_eq!(
+            obj.get("type").and_then(JsonValue::as_str),
+            Some("thinking")
+        );
+        assert_eq!(
+            obj.get("text").and_then(JsonValue::as_str),
+            Some("The user wants 2+2. Sum them.")
+        );
+        // And it round-trips back to the same value.
+        let decoded = ContentBlock::from_json(&json).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
     #[test]
     fn session_timestamps_are_monotonic_under_tight_loops() {
         let first = current_time_millis();

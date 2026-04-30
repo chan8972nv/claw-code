@@ -854,6 +854,44 @@ mod tests {
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{ContentBlock, MessageRole, Session};
+
+    /// build_assistant_message must convert AssistantEvent::Thinking into a
+    /// `ContentBlock::Thinking` so the reasoning is persisted alongside text
+    /// and tool_use blocks. Order: text-before-thinking is preserved (any
+    /// in-flight text is flushed first, mirroring the encoder's emission).
+    #[test]
+    fn build_assistant_message_persists_thinking_block() {
+        let events = vec![
+            AssistantEvent::Thinking("the user is asking 2+2".to_string()),
+            AssistantEvent::TextDelta("Result: 4".to_string()),
+            AssistantEvent::MessageStop,
+        ];
+        let (msg, _usage, _cache) = build_assistant_message(events).expect("assemble");
+        assert_eq!(msg.role, MessageRole::Assistant);
+        assert_eq!(msg.blocks.len(), 2);
+        assert!(matches!(
+            &msg.blocks[0],
+            ContentBlock::Thinking { text } if text == "the user is asking 2+2"
+        ));
+        assert!(matches!(
+            &msg.blocks[1],
+            ContentBlock::Text { text } if text == "Result: 4"
+        ));
+    }
+
+    /// Empty thinking events must not produce empty blocks (would clutter
+    /// session JSONL and Anthropic SDK rejects empty thinking content).
+    #[test]
+    fn build_assistant_message_drops_empty_thinking_block() {
+        let events = vec![
+            AssistantEvent::Thinking(String::new()),
+            AssistantEvent::TextDelta("hi".to_string()),
+            AssistantEvent::MessageStop,
+        ];
+        let (msg, _, _) = build_assistant_message(events).expect("assemble");
+        assert_eq!(msg.blocks.len(), 1);
+        assert!(matches!(&msg.blocks[0], ContentBlock::Text { .. }));
+    }
     use crate::usage::TokenUsage;
     use crate::ToolError;
     use std::fs;
