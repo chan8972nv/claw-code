@@ -5314,6 +5314,11 @@ async fn stream_with_provider(
                 if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
                     events.push(AssistantEvent::ToolUse { id, name, input });
                 }
+                if let Some(reasoning) = pending_thinking.remove(&stop.index) {
+                    if !reasoning.is_empty() {
+                        events.push(AssistantEvent::Thinking(reasoning));
+                    }
+                }
             }
             ApiStreamEvent::MessageDelta(delta) => {
                 events.push(AssistantEvent::Usage(delta.usage.token_usage()));
@@ -5411,33 +5416,34 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } => InputContentBlock::Thinking {
-                        thinking: thinking.clone(),
-                        signature: signature.clone(),
-                    },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => {
+                        Some(InputContentBlock::Text { text: text.clone() })
+                    }
+                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
+                    }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
+                    } => Some(InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    },
+                    }),
+                    // Reasoning content lives in saved sessions for inspection/
+                    // distillation but is intentionally dropped on the wire:
+                    // OpenAI-compat backends generally don't accept a thinking
+                    // input block, and DeepSeek-V4's `encoding_dsv4` regenerates
+                    // its own reasoning per turn (drop_thinking semantics).
+                    ContentBlock::Thinking { .. } => None,
                 })
                 .filter(
                     |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
@@ -5510,6 +5516,11 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
         );
         if let Some((id, name, input)) = pending_tools.remove(&index) {
             events.push(AssistantEvent::ToolUse { id, name, input });
+        }
+        if let Some(reasoning) = pending_thinking.remove(&index) {
+            if !reasoning.is_empty() {
+                events.push(AssistantEvent::Thinking(reasoning));
+            }
         }
     }
 

@@ -388,7 +388,7 @@ fn collect_key_files(messages: &[ConversationMessage]) -> Vec<String> {
         .iter()
         .flat_map(|message| message.blocks.iter())
         .map(|block| match block {
-            ContentBlock::Text { text } => text.as_str(),
+            ContentBlock::Text { text } | ContentBlock::Thinking { text } => text.as_str(),
             ContentBlock::ToolUse { input, .. } => input.as_str(),
             ContentBlock::ToolResult { output, .. } => output.as_str(),
             ContentBlock::Thinking { thinking, .. } => thinking.as_str(),
@@ -460,7 +460,7 @@ fn estimate_message_tokens(message: &ConversationMessage) -> usize {
         .blocks
         .iter()
         .map(|block| match block {
-            ContentBlock::Text { text } => text.len() / 4 + 1,
+            ContentBlock::Text { text } | ContentBlock::Thinking { text } => text.len() / 4 + 1,
             ContentBlock::ToolUse { name, input, .. } => (name.len() + input.len()) / 4 + 1,
             ContentBlock::ToolResult {
                 tool_name, output, ..
