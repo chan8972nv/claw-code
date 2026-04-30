@@ -7257,6 +7257,7 @@ mod tests {
     fn pending_tools_preserve_multiple_streaming_tool_calls_by_index() {
         let mut events = Vec::new();
         let mut pending_tools = BTreeMap::new();
+        let mut pending_thinking = BTreeMap::new();
 
         push_output_block(
             OutputContentBlock::ToolUse {
@@ -7267,6 +7268,7 @@ mod tests {
             1,
             &mut events,
             &mut pending_tools,
+            &mut pending_thinking,
             true,
         );
         push_output_block(
@@ -7278,6 +7280,7 @@ mod tests {
             2,
             &mut events,
             &mut pending_tools,
+            &mut pending_thinking,
             true,
         );
 
