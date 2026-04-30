@@ -461,6 +461,13 @@ struct StreamState {
     dsml_mode: bool,
     dsml_text_buffer: String,
     dsml_message_id: String,
+    /// Track whether server-extracted reasoning (e.g. sglang's
+    /// `--reasoning-parser deepseek-v4` strips `<think>...</think>` and
+    /// surfaces the content via `delta.reasoning_content`) has produced any
+    /// events yet. When true, every other content block's index is shifted
+    /// by 1 to avoid colliding with the reasoning block at index 0.
+    reasoning_started: bool,
+    reasoning_finished: bool,
 }
 
 impl StreamState {
@@ -478,7 +485,32 @@ impl StreamState {
             dsml_mode,
             dsml_text_buffer: String::new(),
             dsml_message_id: String::new(),
+            reasoning_started: false,
+            reasoning_finished: false,
         }
+    }
+
+    /// Index offset added to text and tool_use blocks once a reasoning block
+    /// has been emitted. The reasoning block lives at index 0 and pushes
+    /// everything else down by one.
+    fn block_index_offset(&self) -> u32 {
+        if self.reasoning_started {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Index used for text deltas. 0 by default; 1 once a reasoning block
+    /// has been started at index 0.
+    fn text_block_index(&self) -> u32 {
+        self.block_index_offset()
+    }
+
+    /// Block index for an OpenAI tool_call at openai_index `n`. Without
+    /// reasoning: `n + 1`. With reasoning: `n + 2`.
+    fn tool_block_index(&self, openai_index: u32) -> u32 {
+        openai_index + 1 + self.block_index_offset()
     }
 
     fn ingest_chunk(&mut self, chunk: ChatCompletionChunk) -> Result<Vec<StreamEvent>, ApiError> {
@@ -516,7 +548,38 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
+            // Reasoning deltas come first (sglang's reasoning-parser emits
+            // them before the post-`</think>` content). We claim index 0,
+            // shifting any subsequent text/tool_use to indices 1+.
+            if let Some(reasoning) = choice
+                .delta
+                .reasoning_content
+                .filter(|value| !value.is_empty())
+            {
+                if !self.reasoning_started {
+                    self.reasoning_started = true;
+                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: 0,
+                        content_block: OutputContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: None,
+                        },
+                    }));
+                }
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentBlockDelta::ThinkingDelta { thinking: reasoning },
+                }));
+            }
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
+                // First non-reasoning content arrives → close any open
+                // reasoning block before opening the text/tool_use blocks.
+                if self.reasoning_started && !self.reasoning_finished {
+                    self.reasoning_finished = true;
+                    events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                        index: 0,
+                    }));
+                }
                 if self.dsml_mode {
                     // Hold all text until finish; we cannot detect partial DSML
                     // markup mid-chunk, and emitting raw deltas would expose the
@@ -526,25 +589,37 @@ impl StreamState {
                     if !self.text_started {
                         self.text_started = true;
                         events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                            index: 0,
+                            index: self.text_block_index(),
                             content_block: OutputContentBlock::Text {
                                 text: String::new(),
                             },
                         }));
                     }
                     events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                        index: 0,
+                        index: self.text_block_index(),
                         delta: ContentBlockDelta::TextDelta { text: content },
                     }));
                 }
             }
 
+            // First tool_call also closes any open reasoning block.
+            if !choice.delta.tool_calls.is_empty()
+                && self.reasoning_started
+                && !self.reasoning_finished
+            {
+                self.reasoning_finished = true;
+                events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                    index: 0,
+                }));
+            }
             for tool_call in choice.delta.tool_calls {
-                let state = self.tool_calls.entry(tool_call.index).or_default();
+                let openai_idx = tool_call.index;
+                let block_index = self.tool_block_index(openai_idx);
+                let state = self.tool_calls.entry(openai_idx).or_default();
                 state.apply(tool_call);
-                let block_index = state.block_index();
                 if !state.started {
-                    if let Some(start_event) = state.start_event()? {
+                    if let Some(mut start_event) = state.start_event()? {
+                        start_event.index = block_index;
                         state.started = true;
                         events.push(StreamEvent::ContentBlockStart(start_event));
                     } else {
@@ -556,13 +631,15 @@ impl StreamState {
                 // coercion. Buffer the deltas and emit one coerced delta at
                 // tool_call finish time instead.
                 if !self.dsml_mode {
-                    if let Some(delta_event) = state.delta_event() {
+                    if let Some(mut delta_event) = state.delta_event() {
+                        delta_event.index = block_index;
                         events.push(StreamEvent::ContentBlockDelta(delta_event));
                     }
                 }
                 if choice.finish_reason.as_deref() == Some("tool_calls") && !state.stopped {
                     if self.dsml_mode {
-                        if let Some(coerced) = state.coerced_delta_event() {
+                        if let Some(mut coerced) = state.coerced_delta_event() {
+                            coerced.index = block_index;
                             events.push(StreamEvent::ContentBlockDelta(coerced));
                         }
                     }
@@ -576,16 +653,24 @@ impl StreamState {
             if let Some(finish_reason) = choice.finish_reason {
                 self.stop_reason = Some(normalize_finish_reason(&finish_reason));
                 if finish_reason == "tool_calls" {
-                    for state in self.tool_calls.values_mut() {
+                    let openai_indices: Vec<u32> =
+                        self.tool_calls.keys().copied().collect();
+                    for openai_idx in openai_indices {
+                        let block_index = self.tool_block_index(openai_idx);
+                        let state = self
+                            .tool_calls
+                            .get_mut(&openai_idx)
+                            .expect("tool_calls entry must exist");
                         if state.started && !state.stopped {
                             if self.dsml_mode {
-                                if let Some(coerced) = state.coerced_delta_event() {
+                                if let Some(mut coerced) = state.coerced_delta_event() {
+                                    coerced.index = block_index;
                                     events.push(StreamEvent::ContentBlockDelta(coerced));
                                 }
                             }
                             state.stopped = true;
                             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                                index: state.block_index(),
+                                index: block_index,
                             }));
                         }
                     }
@@ -603,18 +688,24 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
-        if self.text_started && !self.text_finished {
-            self.text_finished = true;
+        if self.reasoning_started && !self.reasoning_finished {
+            self.reasoning_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
                 index: 0,
             }));
         }
+        if self.text_started && !self.text_finished {
+            self.text_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: self.text_block_index(),
+            }));
+        }
 
         // DSML mode: flush the buffered text now, parsing tool calls out of it
-        // and synthesizing the equivalent ContentBlock events. Block indices
-        // start at 0 here because we deliberately suppressed any text events
-        // during streaming.
-        let mut dsml_next_index = 0u32;
+        // and synthesizing the equivalent ContentBlock events. Indices start
+        // at the reasoning offset (1 if reasoning was emitted, 0 otherwise)
+        // because we deliberately suppressed any text events during streaming.
+        let mut dsml_next_index = self.block_index_offset();
         let mut dsml_extracted_tool_uses = false;
         if self.dsml_mode && !self.dsml_text_buffer.is_empty() {
             let id_prefix = format!("toolu_dsml_{}", self.dsml_message_id);
@@ -667,9 +758,16 @@ impl StreamState {
             }
         }
 
-        for state in self.tool_calls.values_mut() {
+        let openai_indices: Vec<u32> = self.tool_calls.keys().copied().collect();
+        for openai_idx in openai_indices {
+            let block_index = self.tool_block_index(openai_idx);
+            let state = self
+                .tool_calls
+                .get_mut(&openai_idx)
+                .expect("tool_calls entry must exist");
             if !state.started {
-                if let Some(start_event) = state.start_event()? {
+                if let Some(mut start_event) = state.start_event()? {
+                    start_event.index = block_index;
                     state.started = true;
                     events.push(StreamEvent::ContentBlockStart(start_event));
                     let delta = if self.dsml_mode {
@@ -677,21 +775,23 @@ impl StreamState {
                     } else {
                         state.delta_event()
                     };
-                    if let Some(delta_event) = delta {
+                    if let Some(mut delta_event) = delta {
+                        delta_event.index = block_index;
                         events.push(StreamEvent::ContentBlockDelta(delta_event));
                     }
                 }
             } else if self.dsml_mode {
                 // Tool call started during streaming with deltas suppressed —
                 // emit the coerced full-args delta now, before Stop.
-                if let Some(delta_event) = state.coerced_delta_event() {
+                if let Some(mut delta_event) = state.coerced_delta_event() {
+                    delta_event.index = block_index;
                     events.push(StreamEvent::ContentBlockDelta(delta_event));
                 }
             }
             if state.started && !state.stopped {
                 state.stopped = true;
                 events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                    index: state.block_index(),
+                    index: block_index,
                 }));
             }
         }
@@ -834,6 +934,13 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
+    /// sglang's `--reasoning-parser` (DeepSeek-V4, Qwen3-Thinking, etc.) and
+    /// vllm's equivalent strip `<think>...</think>` from `content` and surface
+    /// the extracted reasoning here. Without this field the deserializer would
+    /// silently drop it, leaving sessions without any record of the model's
+    /// thinking even though the server-side parsing happened correctly.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ResponseToolCall>,
 }
@@ -880,6 +987,11 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Streaming counterpart of `ChatMessage::reasoning_content`. Each chunk
+    /// carries a partial reasoning slice; we accumulate them in StreamState
+    /// and emit `ContentBlockDelta::ThinkingDelta` events.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
 }
@@ -1355,6 +1467,22 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
+    // Surface server-extracted reasoning (e.g. sglang `--reasoning-parser
+    // deepseek-v4` strips <think>...</think> from `content` and puts it here)
+    // as a Thinking block so the harness can save and inspect it. Comes BEFORE
+    // text/tool_use to mirror the order the model produced it.
+    if let Some(reasoning) = choice
+        .message
+        .reasoning_content
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        content.push(OutputContentBlock::Thinking {
+            thinking: reasoning.to_string(),
+            signature: None,
+        });
+    }
     let mut dsml_tool_use_count = 0usize;
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
         let parsed = if model_emits_dsml_tool_calls(model) {
@@ -3075,5 +3203,178 @@ Let me search for the function.
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
         assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
+    }
+
+    /// Non-streaming response: when the server has stripped `<think>...</think>`
+    /// into `reasoning_content` (sglang's `--reasoning-parser deepseek-v4`),
+    /// `normalize_response` should surface it as a leading `Thinking` block so
+    /// the harness can save and inspect it. Without this the reasoning is
+    /// silently dropped during deserialization.
+    #[test]
+    fn normalize_response_surfaces_reasoning_content_as_thinking_block() {
+        use crate::types::OutputContentBlock;
+        let body = serde_json::json!({
+            "id": "chatcmpl-rsn",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Final answer: 4.",
+                    "reasoning_content": "User asks 2+2. Add the numbers."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 7}
+        });
+        let parsed: super::ChatCompletionResponse = serde_json::from_value(body).unwrap();
+        let resp = super::normalize_response("deepseek-v4-flash", parsed).unwrap();
+
+        // Order: Thinking before Text.
+        assert!(matches!(resp.content[0], OutputContentBlock::Thinking { .. }));
+        if let OutputContentBlock::Thinking { thinking, .. } = &resp.content[0] {
+            assert_eq!(thinking, "User asks 2+2. Add the numbers.");
+        }
+        assert!(matches!(resp.content[1], OutputContentBlock::Text { .. }));
+        if let OutputContentBlock::Text { text } = &resp.content[1] {
+            assert_eq!(text, "Final answer: 4.");
+        }
+    }
+
+    /// Empty / whitespace-only `reasoning_content` should NOT produce a
+    /// Thinking block — Anthropic SDK rejects empty thinking blocks at
+    /// downstream layers, and there's nothing useful to inspect anyway.
+    #[test]
+    fn normalize_response_skips_empty_reasoning_content() {
+        use crate::types::OutputContentBlock;
+        let body = serde_json::json!({
+            "id": "chatcmpl-empty",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "ok",
+                    "reasoning_content": "   "
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let parsed: super::ChatCompletionResponse = serde_json::from_value(body).unwrap();
+        let resp = super::normalize_response("gpt-4o", parsed).unwrap();
+        assert!(
+            !resp.content.iter().any(|b| matches!(b, OutputContentBlock::Thinking { .. })),
+            "whitespace-only reasoning_content must not produce a Thinking block"
+        );
+    }
+
+    /// Streaming response: a chunk carrying `delta.reasoning_content` must
+    /// produce a `Thinking` `ContentBlockStart` at index 0 followed by
+    /// `ThinkingDelta` events. Subsequent text chunks shift to index 1.
+    #[test]
+    fn stream_state_emits_thinking_block_for_reasoning_content_delta() {
+        use crate::types::{
+            ContentBlockDelta, OutputContentBlock, StreamEvent,
+        };
+        let mut state = super::StreamState::new("deepseek-v4-flash".to_string());
+        // Force out of dsml_mode for this test — reasoning delta should work
+        // regardless, but we want a clean text path on the same chunk stream.
+        state.dsml_mode = false;
+
+        // Chunk 1: reasoning delta
+        let chunk1: super::ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "c1",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "delta": {"reasoning_content": "Let me think..."},
+                "finish_reason": null
+            }]
+        })).unwrap();
+        let events = state.ingest_chunk(chunk1).unwrap();
+
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockStart(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].index, 0);
+        assert!(matches!(starts[0].content_block, OutputContentBlock::Thinking { .. }));
+
+        let deltas: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockDelta(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].index, 0);
+        assert!(matches!(
+            &deltas[0].delta,
+            ContentBlockDelta::ThinkingDelta { thinking } if thinking == "Let me think..."
+        ));
+
+        // Chunk 2: text content — should close reasoning at index 0, start
+        // text at index 1.
+        let chunk2: super::ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "c1",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "delta": {"content": "Answer: 42."},
+                "finish_reason": null
+            }]
+        })).unwrap();
+        let events2 = state.ingest_chunk(chunk2).unwrap();
+
+        let stops: Vec<_> = events2
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockStop(s) => Some(s.index),
+                _ => None,
+            })
+            .collect();
+        assert!(stops.contains(&0), "reasoning block (index 0) must close");
+
+        let starts2: Vec<_> = events2
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockStart(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts2.len(), 1);
+        assert_eq!(starts2[0].index, 1, "text block must shift to index 1 after reasoning");
+        assert!(matches!(starts2[0].content_block, OutputContentBlock::Text { .. }));
+    }
+
+    /// Without any reasoning, indices stay at the legacy values (text=0,
+    /// tool_use=1+) — purely additive change for non-thinking models.
+    #[test]
+    fn stream_state_keeps_legacy_indices_when_no_reasoning() {
+        use crate::types::{OutputContentBlock, StreamEvent};
+        let mut state = super::StreamState::new("gpt-4o".to_string());
+        state.dsml_mode = false;
+        let chunk: super::ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "c1",
+            "model": "gpt-4o",
+            "choices": [{
+                "delta": {"content": "hi"},
+                "finish_reason": null
+            }]
+        })).unwrap();
+        let events = state.ingest_chunk(chunk).unwrap();
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockStart(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].index, 0);
+        assert!(matches!(starts[0].content_block, OutputContentBlock::Text { .. }));
     }
 }
