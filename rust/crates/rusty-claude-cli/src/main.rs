@@ -6840,6 +6840,9 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Thinking { text } => {
+                    lines.push(format!("[thinking] {text}"));
+                }
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
@@ -7023,6 +7026,13 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                     let trimmed = text.trim_end();
                     if !trimmed.is_empty() {
                         lines.push(trimmed.to_string());
+                        lines.push(String::new());
+                    }
+                }
+                ContentBlock::Thinking { text } => {
+                    let trimmed = text.trim_end();
+                    if !trimmed.is_empty() {
+                        lines.push(format!("> *thinking:* {trimmed}"));
                         lines.push(String::new());
                     }
                 }
@@ -9164,26 +9174,34 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => {
+                        Some(InputContentBlock::Text { text: text.clone() })
+                    }
+                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
+                    }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
+                    } => Some(InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    },
+                    }),
+                    // Reasoning content stays in saved sessions for inspection
+                    // but is dropped on the wire — most OpenAI-compat servers
+                    // don't accept a thinking-typed input block, and
+                    // server-side encoders that need historical reasoning
+                    // (DeepSeek-V4) regenerate it per turn.
+                    ContentBlock::Thinking { .. } => None,
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {

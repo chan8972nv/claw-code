@@ -41,6 +41,15 @@ pub enum ContentBlock {
         output: String,
         is_error: bool,
     },
+    /// Server-extracted reasoning ("thinking") content. Populated for models
+    /// whose serving stack strips `<think>...</think>` and surfaces the prose
+    /// in a separate `reasoning_content` field (e.g. sglang `--reasoning-parser
+    /// deepseek-v4`, vllm thinking-mode parsers). Stored alongside Text and
+    /// ToolUse blocks so per-instance session JSONLs preserve the reasoning
+    /// for distillation, debugging, and offline analysis.
+    Thinking {
+        text: String,
+    },
 }
 
 /// One conversation message with optional token-usage metadata.
@@ -888,6 +897,13 @@ impl ContentBlock {
                 object.insert("output".to_string(), JsonValue::String(output.clone()));
                 object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
             }
+            Self::Thinking { text } => {
+                object.insert(
+                    "type".to_string(),
+                    JsonValue::String("thinking".to_string()),
+                );
+                object.insert("text".to_string(), JsonValue::String(text.clone()));
+            }
         }
         JsonValue::Object(object)
     }
@@ -917,6 +933,9 @@ impl ContentBlock {
                     .get("is_error")
                     .and_then(JsonValue::as_bool)
                     .ok_or_else(|| SessionError::Format("missing is_error".to_string()))?,
+            }),
+            "thinking" => Ok(Self::Thinking {
+                text: required_string(object, "text")?,
             }),
             other => Err(SessionError::Format(format!(
                 "unsupported block type: {other}"

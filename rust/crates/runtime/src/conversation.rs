@@ -34,6 +34,11 @@ pub enum AssistantEvent {
         name: String,
         input: String,
     },
+    /// Server-extracted reasoning content (full text per thinking block,
+    /// emitted once per block when streaming completes). Persisted into
+    /// session JSONLs as `ContentBlock::Thinking` so reasoning can be
+    /// inspected per-instance offline.
+    Thinking(String),
     Usage(TokenUsage),
     PromptCache(PromptCacheEvent),
     MessageStop,
@@ -731,6 +736,15 @@ fn build_assistant_message(
             AssistantEvent::ToolUse { id, name, input } => {
                 flush_text_block(&mut text, &mut blocks);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
+            }
+            AssistantEvent::Thinking(reasoning) => {
+                // Persist any in-flight text first so the saved order matches
+                // what the server actually emitted (text before reasoning is
+                // unusual but can happen when a parser reorders).
+                flush_text_block(&mut text, &mut blocks);
+                if !reasoning.is_empty() {
+                    blocks.push(ContentBlock::Thinking { text: reasoning });
+                }
             }
             AssistantEvent::Usage(value) => usage = Some(value),
             AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),

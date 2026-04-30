@@ -4643,13 +4643,25 @@ async fn stream_with_provider(
     let mut stream = client.stream_message(message_request).await?;
     let mut events = Vec::new();
     let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+    // Reasoning content (server-extracted <think>...</think>) accumulates
+    // across `ContentBlockDelta::ThinkingDelta` events, keyed by block index,
+    // and flushes as a single `AssistantEvent::Thinking` when the matching
+    // `ContentBlockStop` arrives.
+    let mut pending_thinking: BTreeMap<u32, String> = BTreeMap::new();
     let mut saw_stop = false;
 
     while let Some(event) = stream.next_event().await? {
         match event {
             ApiStreamEvent::MessageStart(start) => {
                 for block in start.message.content {
-                    push_output_block(block, 0, &mut events, &mut pending_tools, true);
+                    push_output_block(
+                        block,
+                        0,
+                        &mut events,
+                        &mut pending_tools,
+                        &mut pending_thinking,
+                        true,
+                    );
                 }
             }
             ApiStreamEvent::ContentBlockStart(start) => {
@@ -4658,6 +4670,7 @@ async fn stream_with_provider(
                     start.index,
                     &mut events,
                     &mut pending_tools,
+                    &mut pending_thinking,
                     true,
                 );
             }
@@ -4672,12 +4685,24 @@ async fn stream_with_provider(
                         input.push_str(&partial_json);
                     }
                 }
-                ContentBlockDelta::ThinkingDelta { .. }
-                | ContentBlockDelta::SignatureDelta { .. } => {}
+                ContentBlockDelta::ThinkingDelta { thinking } => {
+                    if !thinking.is_empty() {
+                        pending_thinking
+                            .entry(delta.index)
+                            .or_default()
+                            .push_str(&thinking);
+                    }
+                }
+                ContentBlockDelta::SignatureDelta { .. } => {}
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
                 if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
                     events.push(AssistantEvent::ToolUse { id, name, input });
+                }
+                if let Some(reasoning) = pending_thinking.remove(&stop.index) {
+                    if !reasoning.is_empty() {
+                        events.push(AssistantEvent::Thinking(reasoning));
+                    }
                 }
             }
             ApiStreamEvent::MessageDelta(delta) => {
@@ -4770,26 +4795,34 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => {
+                        Some(InputContentBlock::Text { text: text.clone() })
+                    }
+                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
+                    }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
+                    } => Some(InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    },
+                    }),
+                    // Reasoning content lives in saved sessions for inspection/
+                    // distillation but is intentionally dropped on the wire:
+                    // OpenAI-compat backends generally don't accept a thinking
+                    // input block, and DeepSeek-V4's `encoding_dsv4` regenerates
+                    // its own reasoning per turn (drop_thinking semantics).
+                    ContentBlock::Thinking { .. } => None,
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -4805,6 +4838,7 @@ fn push_output_block(
     block_index: u32,
     events: &mut Vec<AssistantEvent>,
     pending_tools: &mut BTreeMap<u32, (String, String, String)>,
+    pending_thinking: &mut BTreeMap<u32, String>,
     streaming_tool_input: bool,
 ) {
     match block {
@@ -4824,19 +4858,41 @@ fn push_output_block(
             };
             pending_tools.insert(block_index, (id, name, initial_input));
         }
-        OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
+        OutputContentBlock::Thinking { thinking, .. } => {
+            // Streaming case: ContentBlockStart for a Thinking block carries
+            // an empty body; subsequent ThinkingDeltas fill `pending_thinking`.
+            // Non-streaming case: the body is already complete on first sight,
+            // so seed `pending_thinking` with it. ContentBlockStop (streaming)
+            // or response_to_events's manual flush (non-streaming) drains it
+            // into a single AssistantEvent::Thinking.
+            pending_thinking.insert(block_index, thinking);
+        }
+        OutputContentBlock::RedactedThinking { .. } => {}
     }
 }
 
 fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
     let mut events = Vec::new();
     let mut pending_tools = BTreeMap::new();
+    let mut pending_thinking = BTreeMap::new();
 
     for (index, block) in response.content.into_iter().enumerate() {
         let index = u32::try_from(index).expect("response block index overflow");
-        push_output_block(block, index, &mut events, &mut pending_tools, false);
+        push_output_block(
+            block,
+            index,
+            &mut events,
+            &mut pending_tools,
+            &mut pending_thinking,
+            false,
+        );
         if let Some((id, name, input)) = pending_tools.remove(&index) {
             events.push(AssistantEvent::ToolUse { id, name, input });
+        }
+        if let Some(reasoning) = pending_thinking.remove(&index) {
+            if !reasoning.is_empty() {
+                events.push(AssistantEvent::Thinking(reasoning));
+            }
         }
     }
 
