@@ -714,6 +714,12 @@ impl StreamState {
                 index: self.text_block_index(),
             }));
         }
+        if self.text_started && !self.text_finished {
+            self.text_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: self.text_block_index(),
+            }));
+        }
 
         // DSML mode: flush the buffered text now, parsing tool calls out of it
         // and synthesizing the equivalent ContentBlock events. Block indices
@@ -787,7 +793,8 @@ impl StreamState {
                     } else {
                         state.delta_event(tool_index_offset)
                     };
-                    if let Some(delta_event) = delta {
+                    if let Some(mut delta_event) = delta {
+                        delta_event.index = block_index;
                         events.push(StreamEvent::ContentBlockDelta(delta_event));
                     }
                 }
@@ -970,6 +977,13 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
+    /// sglang's `--reasoning-parser` (DeepSeek-V4, Qwen3-Thinking, etc.) and
+    /// vllm's equivalent strip `<think>...</think>` from `content` and surface
+    /// the extracted reasoning here. Without this field the deserializer would
+    /// silently drop it, leaving sessions without any record of the model's
+    /// thinking even though the server-side parsing happened correctly.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
@@ -1689,6 +1703,8 @@ fn normalize_response(
         .reasoning_content
         .filter(|value| !value.is_empty())
         .or(choice.message.reasoning.filter(|value| !value.is_empty()))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
     {
         content.push(OutputContentBlock::Thinking {
             thinking,
@@ -3903,5 +3919,178 @@ Let me search for the function.
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
         assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
+    }
+
+    /// Non-streaming response: when the server has stripped `<think>...</think>`
+    /// into `reasoning_content` (sglang's `--reasoning-parser deepseek-v4`),
+    /// `normalize_response` should surface it as a leading `Thinking` block so
+    /// the harness can save and inspect it. Without this the reasoning is
+    /// silently dropped during deserialization.
+    #[test]
+    fn normalize_response_surfaces_reasoning_content_as_thinking_block() {
+        use crate::types::OutputContentBlock;
+        let body = serde_json::json!({
+            "id": "chatcmpl-rsn",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Final answer: 4.",
+                    "reasoning_content": "User asks 2+2. Add the numbers."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 7}
+        });
+        let parsed: super::ChatCompletionResponse = serde_json::from_value(body).unwrap();
+        let resp = super::normalize_response("deepseek-v4-flash", parsed).unwrap();
+
+        // Order: Thinking before Text.
+        assert!(matches!(resp.content[0], OutputContentBlock::Thinking { .. }));
+        if let OutputContentBlock::Thinking { thinking, .. } = &resp.content[0] {
+            assert_eq!(thinking, "User asks 2+2. Add the numbers.");
+        }
+        assert!(matches!(resp.content[1], OutputContentBlock::Text { .. }));
+        if let OutputContentBlock::Text { text } = &resp.content[1] {
+            assert_eq!(text, "Final answer: 4.");
+        }
+    }
+
+    /// Empty / whitespace-only `reasoning_content` should NOT produce a
+    /// Thinking block — Anthropic SDK rejects empty thinking blocks at
+    /// downstream layers, and there's nothing useful to inspect anyway.
+    #[test]
+    fn normalize_response_skips_empty_reasoning_content() {
+        use crate::types::OutputContentBlock;
+        let body = serde_json::json!({
+            "id": "chatcmpl-empty",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "ok",
+                    "reasoning_content": "   "
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let parsed: super::ChatCompletionResponse = serde_json::from_value(body).unwrap();
+        let resp = super::normalize_response("gpt-4o", parsed).unwrap();
+        assert!(
+            !resp.content.iter().any(|b| matches!(b, OutputContentBlock::Thinking { .. })),
+            "whitespace-only reasoning_content must not produce a Thinking block"
+        );
+    }
+
+    /// Streaming response: a chunk carrying `delta.reasoning_content` must
+    /// produce a `Thinking` `ContentBlockStart` at index 0 followed by
+    /// `ThinkingDelta` events. Subsequent text chunks shift to index 1.
+    #[test]
+    fn stream_state_emits_thinking_block_for_reasoning_content_delta() {
+        use crate::types::{
+            ContentBlockDelta, OutputContentBlock, StreamEvent,
+        };
+        let mut state = super::StreamState::new("deepseek-v4-flash".to_string());
+        // Force out of dsml_mode for this test — reasoning delta should work
+        // regardless, but we want a clean text path on the same chunk stream.
+        state.dsml_mode = false;
+
+        // Chunk 1: reasoning delta
+        let chunk1: super::ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "c1",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "delta": {"reasoning_content": "Let me think..."},
+                "finish_reason": null
+            }]
+        })).unwrap();
+        let events = state.ingest_chunk(chunk1).unwrap();
+
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockStart(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].index, 0);
+        assert!(matches!(starts[0].content_block, OutputContentBlock::Thinking { .. }));
+
+        let deltas: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockDelta(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].index, 0);
+        assert!(matches!(
+            &deltas[0].delta,
+            ContentBlockDelta::ThinkingDelta { thinking } if thinking == "Let me think..."
+        ));
+
+        // Chunk 2: text content — should close reasoning at index 0, start
+        // text at index 1.
+        let chunk2: super::ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "c1",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "delta": {"content": "Answer: 42."},
+                "finish_reason": null
+            }]
+        })).unwrap();
+        let events2 = state.ingest_chunk(chunk2).unwrap();
+
+        let stops: Vec<_> = events2
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockStop(s) => Some(s.index),
+                _ => None,
+            })
+            .collect();
+        assert!(stops.contains(&0), "reasoning block (index 0) must close");
+
+        let starts2: Vec<_> = events2
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockStart(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts2.len(), 1);
+        assert_eq!(starts2[0].index, 1, "text block must shift to index 1 after reasoning");
+        assert!(matches!(starts2[0].content_block, OutputContentBlock::Text { .. }));
+    }
+
+    /// Without any reasoning, indices stay at the legacy values (text=0,
+    /// tool_use=1+) — purely additive change for non-thinking models.
+    #[test]
+    fn stream_state_keeps_legacy_indices_when_no_reasoning() {
+        use crate::types::{OutputContentBlock, StreamEvent};
+        let mut state = super::StreamState::new("gpt-4o".to_string());
+        state.dsml_mode = false;
+        let chunk: super::ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "c1",
+            "model": "gpt-4o",
+            "choices": [{
+                "delta": {"content": "hi"},
+                "finish_reason": null
+            }]
+        })).unwrap();
+        let events = state.ingest_chunk(chunk).unwrap();
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockStart(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].index, 0);
+        assert!(matches!(starts[0].content_block, OutputContentBlock::Text { .. }));
     }
 }
