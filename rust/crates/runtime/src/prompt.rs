@@ -518,17 +518,12 @@ fn get_simple_system_section() -> String {
 
 fn get_simple_doing_tasks_section() -> String {
     let items = prepend_bullets(vec![
-        "Read relevant code before changing it and keep changes tightly scoped to the request.".to_string(),
-        "Do not add speculative abstractions, compatibility shims, or unrelated cleanup.".to_string(),
-        "Do not create files unless they are required to complete the task.".to_string(),
-        "If an approach fails, diagnose the failure before switching tactics.".to_string(),
-        "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
-        "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
-        "Before editing, trace bugs to their root cause — fix where the problem originates (utility, base class, data layer), not where the symptom appears (caller, formatter, view).".to_string(),
-        "Check how similar patterns are handled elsewhere in the codebase. If the same idiom appears in multiple places, match it exactly.".to_string(),
-        "Prefer the smallest possible fix. If you are changing more than ~15 lines, reconsider whether you are fixing the right thing.".to_string(),
-        "Never modify test files to make them match your fix. Your code change must make existing tests pass as-is.".to_string(),
-        "After making a fix, run the project's own test suite for the relevant module — not just a custom inline script.".to_string(),
+        "Read relevant code before changing it; keep changes scoped to the request and do not create files unless required.".to_string(),
+        "Do not add speculative abstractions, compatibility shims, or unrelated cleanup. When the issue says existing behavior is wrong, replace it — do not preserve both branches via `or fallback_to_old` or `if old: ... else:`.".to_string(),
+        "Trace bugs to their root cause: fix at the source (utility, base class, data layer), not at the symptom site (caller, formatter, view). If the same bug could surface from any other caller, you are at the wrong layer. Override the canonical method (e.g. `as_set`), not a parallel dispatch hook.".to_string(),
+        "Avoid security vulnerabilities (command injection, XSS, SQL injection).".to_string(),
+        "Never modify test files to make them match your fix. After editing, run the project's own test runner for the affected module — not a custom inline script.".to_string(),
+        "Report outcomes faithfully: if verification failed or was not run, say so explicitly. Patch size is not a quality signal — a small fix in the wrong layer is worse than a larger fix at the right one.".to_string(),
     ]);
 
     let tool_items = prepend_bullets(vec![
