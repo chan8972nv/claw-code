@@ -517,52 +517,35 @@ fn get_simple_system_section() -> String {
 }
 
 fn get_simple_doing_tasks_section() -> String {
+    // Each bullet covers a single distinct concern. Do not collapse two
+    // concerns into one bullet (that historically created repetition without
+    // making any one rule easier to follow), and do not duplicate the same
+    // concern across bullets (the model echoes redundancy back as repeated
+    // narration).
     let items = prepend_bullets(vec![
-        "Read relevant code before changing it; keep changes scoped to the request and do not create files unless required.".to_string(),
-        "Do not add speculative abstractions, compatibility shims, or unrelated cleanup. When the issue says existing behavior is wrong, replace it — do not preserve both branches via `or fallback_to_old` or `if old: ... else:`.".to_string(),
-        "Trace bugs to their root cause: fix at the source (utility, base class, data layer), not at the symptom site (caller, formatter, view). If the same bug could surface from any other caller, you are at the wrong layer. Override the canonical method (e.g. `as_set`), not a parallel dispatch hook.".to_string(),
-        "Avoid security vulnerabilities (command injection, XSS, SQL injection).".to_string(),
-        "Never modify test files to make them match your fix. After editing, run the project's own test runner for the affected module — not a custom inline script.".to_string(),
-        "Report outcomes faithfully: if verification failed or was not run, say so explicitly. Patch size is not a quality signal — a small fix in the wrong layer is worse than a larger fix at the right one.".to_string(),
+        // --- Exploration and scope ---
+        "Read relevant code before changing it. If you find yourself reading the same file a third time, page through it with `read_file` offsets instead of restarting from the top — repeated whole-file reads waste context and rarely surface anything new.".to_string(),
+        "Keep changes tightly scoped to the request. Do not add speculative abstractions, compatibility shims, unrelated refactors, or new files unless the task genuinely requires them.".to_string(),
+        "Do not modify packaging or build metadata (`setup.py`, `setup.cfg`, `pyproject.toml`, `requirements.txt`, `tox.ini`, CI configs) unless the issue is explicitly about packaging. Environment workarounds belong in the harness, not in the patch.".to_string(),
+        // --- Diagnosis and fix layer ---
+        "Before editing, trace the bug to its root cause and fix where the problem originates (utility, base class, data layer), not where the symptom appears (caller, formatter, view). If the same bug could surface from any other caller, you are at the wrong layer — name the deepest function that already implements the buggy behavior and fix it there.".to_string(),
+        "When the issue says existing behavior is wrong, replace it. Do not preserve both branches via `or fallback_to_old` or `if old: ... else:`, and do not introduce a parallel dispatch hook alongside the canonical method — override the canonical method itself.".to_string(),
+        "Check how similar patterns are handled elsewhere in the codebase. If the same idiom appears in multiple places, match it exactly rather than inventing a new shape.".to_string(),
+        "Prefer the smallest fix that resolves the root cause. Patch size is not a quality signal — a small fix in the wrong layer is worse than a larger fix at the right one — but if you are changing more than ~15 lines, pause and reconsider whether you are fixing the right thing.".to_string(),
+        // --- Tests and verification ---
+        "Never modify test files to make them match your fix. The existing tests must pass against your code change as-is. Adding a brand-new test that demonstrates the fix is fine; loosening or deleting existing assertions is not.".to_string(),
+        "Before declaring the task complete, run the project's own test runner against (a) the specific failing test(s) named in the issue and (b) every other test in the same module or file — not a custom inline script. If you have not executed those tests in the current state of the repo, say so explicitly rather than claiming success.".to_string(),
+        // --- Loop / thrash control ---
+        "If two consecutive edits to the same file fail to fix the issue, stop editing. Re-read the failing test verbatim, write a small reproducer that compares observed vs. expected output, and articulate the gap in one sentence before attempting a third edit. Random-walking between tactics wastes turns and rarely converges.".to_string(),
+        // --- Tool result hygiene ---
+        "Tool results larger than ~50 KB are a red flag — narrow the search with file-type filters, line-range limits, or `head` before processing. Never paste raw, unfiltered tool output into your reasoning.".to_string(),
+        "If the conversation has been compacted, trust the summary and resume from where you left off. Re-read only the specific line ranges you have not seen — do not start the investigation over from the top of files you already explored.".to_string(),
+        // --- Reporting ---
+        "Never submit an empty patch. If your best attempt regresses some tests, keep the partial fix and explain the trade-off in your final summary; do not revert to the original state.".to_string(),
+        "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
+        "Report outcomes faithfully: if verification failed or was not run, say so explicitly.".to_string(),
     ]);
-
-    let tool_items = prepend_bullets(vec![
-        "bash: Execute shell commands with optional timeout and background mode. Use for running tests, installing packages, and system operations. Avoid using it for tasks that have a dedicated tool (searching, reading, editing).".to_string(),
-        "read_file: Read file contents with optional offset/limit for pagination. Supports text files, images, and PDFs. Prefer this over bash cat/head/tail.".to_string(),
-        "write_file: Create or overwrite files. Use only for new files; prefer edit_file for modifying existing ones.".to_string(),
-        "edit_file: Surgical find-and-replace edits in existing files. Requires unique old_string match; supports replace_all for bulk renames. Prefer this over bash sed/awk.".to_string(),
-        "glob_search: Fast file discovery by glob pattern (e.g., **/*.py). Use to discover project layout before reading files.".to_string(),
-        "grep_search: Regex content search powered by ripgrep. Supports file type filters, context lines, and output modes (content, files_with_matches, count). Prefer this over bash grep/rg — it produces compact output and conserves context.".to_string(),
-        "REPL: Execute code snippets directly in python (python3 -c), javascript (node -e), or bash (bash -lc). Use for quick validation instead of bash python -c.".to_string(),
-        "WebFetch: Fetch a URL and return its contents with an optional prompt to extract specific information.".to_string(),
-        "WebSearch: Search the web with a query. Supports allowed_domains and blocked_domains filtering.".to_string(),
-        "TodoWrite: Manage a structured task list for the session with status tracking (pending/in_progress/completed).".to_string(),
-        "Agent: Spawn sub-agent threads with isolated tool sets. Supports agent types (General, Explore, Verification) each with a filtered tool allowlist.".to_string(),
-        "NotebookEdit: Edit Jupyter notebook cells with replace, insert, and delete modes for code or markdown cells.".to_string(),
-        "ToolSearch: Search for deferred/specialized tools by keyword or exact name. Returns full schema so the tool becomes callable.".to_string(),
-        "Skill: Load and execute local skill definitions (e.g., /commit, /pr) from configured skill directories.".to_string(),
-    ]);
-
-    let tool_guidance = prepend_bullets(vec![
-        // Core tool preferences over bash
-        "Minimize bash usage — prefer the dedicated tools which are faster, produce less output, and conserve context.".to_string(),
-        "Use grep_search instead of bash grep/rg for searching file contents. It returns compact, structured results.".to_string(),
-        "Use glob_search to discover project layout and find files by pattern before reading them.".to_string(),
-        "Use read_file with offset/limit for large files instead of bash cat/head/tail. This avoids flooding context with unnecessary content.".to_string(),
-        "Use edit_file for surgical edits instead of write_file or bash sed/awk. It ensures precise, reviewable changes.".to_string(),
-        "Use REPL for quick Python/JS validation instead of bash python -c. It runs code directly without shell quoting issues.".to_string(),
-        // Web tools
-        "Use WebFetch to retrieve documentation, API references, or error explanations from URLs. Avoids relying on bash curl which dumps raw HTML.".to_string(),
-        "Use WebSearch when you need to look up error messages, library APIs, or unfamiliar patterns. Faster than guessing.".to_string(),
-        // Task management
-        "Use TodoWrite to track multi-step plans. Break complex tasks into pending/in_progress/completed items so progress survives compaction.".to_string(),
-        // Advanced tools
-        "Use Agent to delegate independent sub-tasks (e.g., searching a large codebase, running verification) in parallel without bloating the main context.".to_string(),
-        "Use NotebookEdit when modifying Jupyter notebooks — do not rewrite the entire .ipynb with write_file.".to_string(),
-        "Use ToolSearch to discover specialized tools when built-in tools are insufficient for the task.".to_string(),
-        "Use Skill to invoke predefined workflows (e.g., /commit, /pr) instead of manually assembling multi-step bash sequences.".to_string(),
-    ]);
-
+    
     // Include tool descriptions and usage guidance only when CLAW_INCLUDE_TOOL_GUIDANCE=1
     // is set. This allows ablation studies to measure the impact of tool guidance
     // independently of other prompt changes.
@@ -571,12 +554,6 @@ fn get_simple_doing_tasks_section() -> String {
 
     let mut sections: Vec<String> = vec!["# Doing tasks".to_string()];
     sections.extend(items);
-    if include_tool_guidance {
-        sections.push("\n# Available tools".to_string());
-        sections.extend(tool_items);
-        sections.push("\n# Tool usage guidance".to_string());
-        sections.extend(tool_guidance);
-    }
     sections.join("\n")
 }
 
