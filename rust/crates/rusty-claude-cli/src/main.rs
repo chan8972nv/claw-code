@@ -4942,7 +4942,30 @@ fn solve_problem(
     }
 
     eprintln!("[solve] Extracting patch via git diff...");
-    let patch_output = std::process::Command::new("git").args(["diff"]).output();
+    // Stage everything first so newly-created (untracked) files land in the
+    // patch. A plain `git diff` only reports changes to tracked files, which
+    // silently drops any file the agent CREATED — losing fixes that add a new
+    // file entirely. We exclude claw's own `.claw/` config dir (settings,
+    // hooks, sessions) and an injected `CLAUDE.md` instruction file so neither
+    // pollutes the emitted patch. `--binary` keeps binary-file hunks applyable.
+    let pathspec = [".", ":(exclude).claw", ":(exclude)CLAUDE.md"];
+    let stage_result = std::process::Command::new("git")
+        .args(["add", "-A", "--"])
+        .args(pathspec)
+        .output();
+    if let Ok(output) = &stage_result {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            eprintln!("[solve] git add stderr: {stderr}");
+        }
+    } else if let Err(error) = &stage_result {
+        eprintln!("[solve] Failed to stage changes: {error}");
+    }
+
+    let patch_output = std::process::Command::new("git")
+        .args(["diff", "--cached", "--binary", "--"])
+        .args(pathspec)
+        .output();
 
     let patch = match patch_output {
         Ok(output) => {
