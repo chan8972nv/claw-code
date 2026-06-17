@@ -4985,6 +4985,33 @@ fn solve_problem(
         ":(exclude)**/.pytest_cache/**",
         ":(exclude).mypy_cache",
         ":(exclude)**/.mypy_cache/**",
+        // Package-manager caches: matter when claw runs WITHOUT a sandbox home
+        // so a tool writes its cache to $HOME == repo root (e.g. `stack` dumped
+        // the Hackage index into .stack for a 1.4 GB patch). Never part of a fix.
+        ":(exclude).stack",
+        ":(exclude)**/.stack/**",
+        ":(exclude).cargo",
+        ":(exclude)**/.cargo/**",
+        ":(exclude).m2",
+        ":(exclude)**/.m2/**",
+        ":(exclude).npm",
+        ":(exclude)**/.npm/**",
+        ":(exclude).gradle",
+        ":(exclude)**/.gradle/**",
+        ":(exclude).bundle",
+        ":(exclude)**/.bundle/**",
+        ":(exclude).cache",
+        ":(exclude)**/.cache/**",
+        ":(exclude).ccache",
+        ":(exclude)**/.ccache/**",
+        ":(exclude).gem",
+        ":(exclude)**/.gem/**",
+        ":(exclude).nuget",
+        ":(exclude)**/.nuget/**",
+        ":(exclude).cabal",
+        ":(exclude)**/.cabal/**",
+        ":(exclude).ivy2",
+        ":(exclude)**/.ivy2/**",
     ];
     let stage_result = std::process::Command::new("git")
         .args(["add", "-A", "--"])
