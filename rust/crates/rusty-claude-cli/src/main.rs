@@ -4945,10 +4945,47 @@ fn solve_problem(
     // Stage everything first so newly-created (untracked) files land in the
     // patch. A plain `git diff` only reports changes to tracked files, which
     // silently drops any file the agent CREATED — losing fixes that add a new
-    // file entirely. We exclude claw's own `.claw/` config dir (settings,
-    // hooks, sessions) and an injected `CLAUDE.md` instruction file so neither
-    // pollutes the emitted patch. `--binary` keeps binary-file hunks applyable.
-    let pathspec = [".", ":(exclude).claw", ":(exclude)CLAUDE.md"];
+    // file entirely. `--binary` keeps binary-file hunks applyable.
+    //
+    // Exclude claw's own runtime artifacts, which live inside the working tree
+    // and are NOT in the repo's .gitignore, so `git add -A` would otherwise
+    // sweep them into the patch (observed: patches with 1000+ junk files that
+    // break `git apply`):
+    //   - `.claw/`            : config, hooks, sessions
+    //   - `.clawd-todos.json` : TodoWrite scratch file
+    //   - `.sandbox-home/`    : sandboxed agent's $HOME (build/dep caches, logs)
+    //   - `.sandbox-tmp/`     : sandboxed agent's $TMP (test caches)
+    //   - `CLAUDE.md`         : injected instruction file
+    // Second group: dependency/build cache dirs some repos fail to .gitignore;
+    // never part of a real fix. Each needs TWO patterns: the bare name excludes
+    // a top-level dir and its contents (git treats a literal dir pathspec as a
+    // prefix match), while `**/<name>/**` excludes the contents when the dir is
+    // NESTED (git's leading `**/` requires >=1 path segment, so it misses the
+    // top-level case). Verified against git 2.34.
+    let pathspec = [
+        ".",
+        ":(exclude).claw",
+        ":(exclude).clawd-todos.json",
+        ":(exclude).sandbox-home",
+        ":(exclude).sandbox-tmp",
+        ":(exclude)CLAUDE.md",
+        ":(exclude)node_modules",
+        ":(exclude)**/node_modules/**",
+        ":(exclude)__pycache__",
+        ":(exclude)**/__pycache__/**",
+        ":(exclude).venv",
+        ":(exclude)**/.venv/**",
+        ":(exclude)venv",
+        ":(exclude)**/venv/**",
+        ":(exclude).tox",
+        ":(exclude)**/.tox/**",
+        ":(exclude)*.egg-info",
+        ":(exclude)**/*.egg-info/**",
+        ":(exclude).pytest_cache",
+        ":(exclude)**/.pytest_cache/**",
+        ":(exclude).mypy_cache",
+        ":(exclude)**/.mypy_cache/**",
+    ];
     let stage_result = std::process::Command::new("git")
         .args(["add", "-A", "--"])
         .args(pathspec)
