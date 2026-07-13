@@ -248,6 +248,7 @@ impl GlobalToolRegistry {
     pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
         let builtin = mvp_tool_specs()
             .into_iter()
+            .filter(|spec| !is_disabled_web_tool(spec.name))
             .filter(|spec| {
                 allowed_tools
                     .is_none_or(|allowed| allowed.contains(&canonical_allowed_tool_name(spec.name)))
@@ -294,6 +295,7 @@ impl GlobalToolRegistry {
     ) -> Result<Vec<(String, PermissionMode)>, String> {
         let builtin = mvp_tool_specs()
             .into_iter()
+            .filter(|spec| !is_disabled_web_tool(spec.name))
             .filter(|spec| {
                 allowed_tools
                     .is_none_or(|allowed| allowed.contains(&canonical_allowed_tool_name(spec.name)))
@@ -477,6 +479,34 @@ fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
         "danger-full-access" => Ok(PermissionMode::DangerFullAccess),
         other => Err(format!("unsupported plugin permission: {other}")),
     }
+}
+
+/// Tools that fetch arbitrary URLs off the internet.
+pub const WEB_TOOL_NAMES: [&str; 2] = ["WebFetch", "WebSearch"];
+
+/// Message returned when a disabled web tool is invoked.
+pub const WEB_TOOLS_DISABLED_MSG: &str =
+    "WebFetch/WebSearch are disabled (CLAW_DISABLE_WEB_TOOLS): solve from the repository only.";
+
+/// True when `CLAW_DISABLE_WEB_TOOLS` is set to a truthy value. Used (e.g. by
+/// SWE-bench eval harnesses) to stop the agent fetching an upstream fix off the
+/// web without blocking the network. Hides `WebFetch`/`WebSearch` from the model
+/// and refuses them if called anyway.
+#[must_use]
+pub fn web_tools_disabled() -> bool {
+    matches!(
+        std::env::var("CLAW_DISABLE_WEB_TOOLS")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1") | Some("true") | Some("TRUE") | Some("True") | Some("yes") | Some("on")
+    )
+}
+
+/// True when `name` is a web tool AND web tools are disabled.
+#[must_use]
+fn is_disabled_web_tool(name: &str) -> bool {
+    web_tools_disabled() && WEB_TOOL_NAMES.contains(&name)
 }
 
 #[must_use]
@@ -1357,6 +1387,7 @@ fn execute_tool_with_enforcer(
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
             run_grep_search(grep_input)
         }
+        "WebFetch" | "WebSearch" if web_tools_disabled() => Err(WEB_TOOLS_DISABLED_MSG.to_string()),
         "WebFetch" => {
             let web_input = from_value::<WebFetchInput>(input)?;
             maybe_enforce_permission_check_with_mode(
