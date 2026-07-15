@@ -5469,20 +5469,19 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         }],
                         is_error: *is_error,
                     }),
-                    // Reasoning is normally dropped on the wire (OpenAI-compat
-                    // backends reject a thinking-typed input block; DeepSeek-V4
-                    // regenerates its own per turn). Set CLAW_PRESERVE_REASONING to
-                    // keep prior chain-of-thought in history — for distillation /
-                    // reasoning-parser round-trips — by re-injecting it INLINE as a
-                    // <think>...</think> text block (the exact form the model
-                    // produced), not a structured field the backend would reject.
+                    // Reasoning is normally dropped on the wire. Set
+                    // CLAW_PRESERVE_REASONING to keep prior chain-of-thought in
+                    // history (distillation / reasoning-parser round-trips): carry it
+                    // through as an InputContentBlock::Thinking, which translate_message
+                    // replays to OpenAI-compat backends as a top-level `reasoning` key
+                    // on the assistant message (matches OpenHands' interleaved reasoning).
                     ContentBlock::Thinking { text } => {
                         let preserve = matches!(
                             std::env::var("CLAW_PRESERVE_REASONING").ok().as_deref().map(str::trim),
                             Some("1") | Some("true") | Some("TRUE") | Some("True") | Some("yes") | Some("on")
                         );
                         if preserve && !text.trim().is_empty() {
-                            Some(InputContentBlock::Text { text: format!("<think>{text}</think>") })
+                            Some(InputContentBlock::Thinking { text: text.clone() })
                         } else {
                             None
                         }

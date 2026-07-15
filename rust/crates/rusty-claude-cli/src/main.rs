@@ -14499,18 +14499,17 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         }],
                         is_error: *is_error,
                     }),
-                    // Dropped on the wire by default (most OpenAI-compat servers
-                    // reject a thinking-typed input block; DeepSeek-V4 regenerates
-                    // it per turn). CLAW_PRESERVE_REASONING re-injects prior CoT
-                    // INLINE as a <think>...</think> text block for distillation /
-                    // reasoning-parser round-trips (see convert_messages in tools).
+                    // Dropped on the wire by default. CLAW_PRESERVE_REASONING carries
+                    // prior CoT through as an InputContentBlock::Thinking, which
+                    // translate_message replays as a top-level `reasoning` key on the
+                    // assistant message (matches OpenHands). See convert_messages in tools.
                     ContentBlock::Thinking { text } => {
                         let preserve = matches!(
                             std::env::var("CLAW_PRESERVE_REASONING").ok().as_deref().map(str::trim),
                             Some("1") | Some("true") | Some("TRUE") | Some("True") | Some("yes") | Some("on")
                         );
                         if preserve && !text.trim().is_empty() {
-                            Some(InputContentBlock::Text { text: format!("<think>{text}</think>") })
+                            Some(InputContentBlock::Thinking { text: text.clone() })
                         } else {
                             None
                         }

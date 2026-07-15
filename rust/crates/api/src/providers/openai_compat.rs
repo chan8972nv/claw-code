@@ -1457,6 +1457,7 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
+                    // Prior CoT (only present when CLAW_PRESERVE_REASONING is set).
                     InputContentBlock::Thinking {
                         thinking: value, ..
                     } => reasoning.push_str(value),
@@ -1491,6 +1492,17 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                 if !tool_calls.is_empty() {
                     msg["tool_calls"] = json!(tool_calls);
                 }
+                // Replay reasoning under the key the reasoning-model chat template
+                // reads for historical CoT (default `reasoning`, matching OpenHands'
+                // OPENHANDS_REASONING_REPLAY_FIELD; override via CLAW_REASONING_REPLAY_FIELD).
+                if !reasoning.is_empty() {
+                    let field = std::env::var("CLAW_REASONING_REPLAY_FIELD")
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "reasoning".to_string());
+                    msg[field] = json!(reasoning);
+                }
                 vec![msg]
             }
         }
@@ -1519,6 +1531,7 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     }
                     Some(msg)
                 }
+                // A reasoning block on a non-assistant message is nonsensical; drop it.
                 InputContentBlock::Thinking { .. } | InputContentBlock::ToolUse { .. } => None,
             })
             .collect(),
