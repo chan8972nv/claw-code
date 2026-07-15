@@ -14499,12 +14499,22 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         }],
                         is_error: *is_error,
                     }),
-                    // Reasoning content stays in saved sessions for inspection
-                    // but is dropped on the wire — most OpenAI-compat servers
-                    // don't accept a thinking-typed input block, and
-                    // server-side encoders that need historical reasoning
-                    // (DeepSeek-V4) regenerate it per turn.
-                    ContentBlock::Thinking { .. } => None,
+                    // Dropped on the wire by default (most OpenAI-compat servers
+                    // reject a thinking-typed input block; DeepSeek-V4 regenerates
+                    // it per turn). CLAW_PRESERVE_REASONING re-injects prior CoT
+                    // INLINE as a <think>...</think> text block for distillation /
+                    // reasoning-parser round-trips (see convert_messages in tools).
+                    ContentBlock::Thinking { text } => {
+                        let preserve = matches!(
+                            std::env::var("CLAW_PRESERVE_REASONING").ok().as_deref().map(str::trim),
+                            Some("1") | Some("true") | Some("TRUE") | Some("True") | Some("yes") | Some("on")
+                        );
+                        if preserve && !text.trim().is_empty() {
+                            Some(InputContentBlock::Text { text: format!("<think>{text}</think>") })
+                        } else {
+                            None
+                        }
+                    }
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
