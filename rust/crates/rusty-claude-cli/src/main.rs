@@ -13166,6 +13166,19 @@ impl From<RuntimeError> for StreamAttemptFailure {
 /// this impl is the one solve mode actually uses.
 const CLI_STREAM_ATTEMPT_RETRIES: u32 = 3;
 
+/// Whole-request retry budget, overridable via CLAW_STREAM_RETRIES. The
+/// default (3 retries, 2+4+8s = 14s of backoff) rides out load blips but not
+/// a server restart: aug_07 lost 16 sessions in one minute when a transient
+/// outage outlasted the budget while 25 other sessions were saved by it.
+/// Eval harnesses set a larger budget (e.g. 8 -> 2+4+8+16+32*4 = 158s).
+fn cli_stream_attempt_retries() -> u32 {
+    std::env::var("CLAW_STREAM_RETRIES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|n| *n <= 20)
+        .unwrap_or(CLI_STREAM_ATTEMPT_RETRIES)
+}
+
 fn cli_stream_retry_backoff(attempt: u32) -> std::time::Duration {
     // 2s, 4s, 8s.
     std::time::Duration::from_secs(2u64 << (attempt.saturating_sub(1)).min(4))
@@ -13200,6 +13213,7 @@ impl ApiClient for AnthropicRuntimeClient {
             // deadline we drop the stalled connection and re-send the request as
             // a continuation nudge (one retry only).
             let max_attempts: usize = if is_post_tool { 2 } else { 1 };
+            let retry_budget = cli_stream_attempt_retries();
             let mut retries = 0u32;
 
             for attempt in 1..=max_attempts {
@@ -13219,11 +13233,11 @@ impl ApiClient for AnthropicRuntimeClient {
                         Err(failure)
                             if failure.retryable
                                 && (!failure.received_any_event || !self.emit_output)
-                                && retries < CLI_STREAM_ATTEMPT_RETRIES =>
+                                && retries < retry_budget =>
                         {
                             retries += 1;
                             eprintln!(
-                                "stream attempt failed with retryable error (retry {retries}/{CLI_STREAM_ATTEMPT_RETRIES}): {}",
+                                "stream attempt failed with retryable error (retry {retries}/{retry_budget}): {}",
                                 failure.error
                             );
                             tokio::time::sleep(cli_stream_retry_backoff(retries)).await;
