@@ -30,10 +30,6 @@ fn run_bash(command: &str) -> Result<String, String> {
     workspace_write_registry().execute("bash", &json!({ "command": command }))
 }
 
-fn run_powershell(command: &str) -> Result<String, String> {
-    workspace_write_registry().execute("PowerShell", &json!({ "command": command }))
-}
-
 fn run_read_file(path: &Path) -> Result<String, String> {
     workspace_write_registry().execute("read_file", &json!({ "path": path.display().to_string() }))
 }
@@ -190,16 +186,6 @@ fn windows_style_absolute_paths_are_denied_before_execution() {
         assert_permission_denied(run_bash(command), name);
     }
 
-    for (name, command) in [
-        (
-            "powershell windows drive backslash",
-            r"Get-Content -Path C:\Users\attacker\secret.txt",
-        ),
-        (
-            "powershell windows drive slash",
-            r"Get-Content -Path C:/Users/attacker/secret.txt",
-        ),
-    ] {
-        assert_permission_denied(run_powershell(command), name);
-    }
+    // PowerShell cases dropped: the PowerShell tool was removed from the tool
+    // set (tool-bloat reduction), so there is no dispatch path left to enforce.
 }

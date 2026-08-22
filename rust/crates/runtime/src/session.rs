@@ -34,6 +34,11 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    /// Reasoning ("thinking") content. Also populated for models whose serving
+    /// stack strips `<think>...</think>` and surfaces the prose in a separate
+    /// `reasoning_content` field (e.g. sglang `--reasoning-parser deepseek-v4`,
+    /// vllm thinking-mode parsers), so per-instance session JSONLs preserve the
+    /// reasoning for distillation, debugging, and offline analysis.
     Thinking {
         thinking: String,
         signature: Option<String>,
@@ -48,15 +53,6 @@ pub enum ContentBlock {
         tool_name: String,
         output: String,
         is_error: bool,
-    },
-    /// Server-extracted reasoning ("thinking") content. Populated for models
-    /// whose serving stack strips `<think>...</think>` and surfaces the prose
-    /// in a separate `reasoning_content` field (e.g. sglang `--reasoning-parser
-    /// deepseek-v4`, vllm thinking-mode parsers). Stored alongside Text and
-    /// ToolUse blocks so per-instance session JSONLs preserve the reasoning
-    /// for distillation, debugging, and offline analysis.
-    Thinking {
-        text: String,
     },
 }
 
@@ -671,9 +667,7 @@ impl Session {
                         ))
                     })?;
                     let msg = ConversationMessage::from_json(message_value)?;
-                    full_message_history
-                        .get_or_insert_with(Vec::new)
-                        .push(msg);
+                    full_message_history.get_or_insert_with(Vec::new).push(msg);
                 }
                 other => {
                     return Err(SessionError::Format(format!(
@@ -1000,13 +994,6 @@ impl ContentBlock {
                 object.insert("output".to_string(), JsonValue::String(output.clone()));
                 object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
             }
-            Self::Thinking { text } => {
-                object.insert(
-                    "type".to_string(),
-                    JsonValue::String("thinking".to_string()),
-                );
-                object.insert("text".to_string(), JsonValue::String(text.clone()));
-            }
         }
         JsonValue::Object(object)
     }
@@ -1043,9 +1030,6 @@ impl ContentBlock {
                     .get("is_error")
                     .and_then(JsonValue::as_bool)
                     .ok_or_else(|| SessionError::Format("missing is_error".to_string()))?,
-            }),
-            "thinking" => Ok(Self::Thinking {
-                text: required_string(object, "text")?,
             }),
             other => Err(SessionError::Format(format!(
                 "unsupported block type: {other}"
@@ -1604,7 +1588,8 @@ mod tests {
     #[test]
     fn thinking_content_block_round_trips_through_json() {
         let original = ContentBlock::Thinking {
-            text: "The user wants 2+2. Sum them.".to_string(),
+            thinking: "The user wants 2+2. Sum them.".to_string(),
+            signature: None,
         };
         let json = original.to_json();
         // Verify the wire shape matches what session writers emit.
@@ -1614,7 +1599,7 @@ mod tests {
             Some("thinking")
         );
         assert_eq!(
-            obj.get("text").and_then(JsonValue::as_str),
+            obj.get("thinking").and_then(JsonValue::as_str),
             Some("The user wants 2+2. Sum them.")
         );
         // And it round-trips back to the same value.

@@ -689,9 +689,10 @@ fn render_config_section(config: &RuntimeConfig) -> String {
 
 fn get_simple_intro_section(has_output_style: bool) -> String {
     let use_minimax = std::env::var("CLAW_MINIMAX_IDENTITY")
-        .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let identity = if use_minimax {
-        "You are a helpful assistant. Your name is MiniMax-M2.5 and is built by MiniMax.".to_string()
+        "You are a helpful assistant. Your name is MiniMax-M2.5 and is built by MiniMax."
+            .to_string()
     } else {
         format!(
             "You are an interactive agent that helps users {}",
@@ -752,12 +753,12 @@ fn get_simple_doing_tasks_section() -> String {
         "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
         "Report outcomes faithfully: if verification failed or was not run, say so explicitly.".to_string(),
     ]);
-    
+
     // Include tool descriptions and usage guidance only when CLAW_INCLUDE_TOOL_GUIDANCE=1
     // is set. This allows ablation studies to measure the impact of tool guidance
     // independently of other prompt changes.
-    let include_tool_guidance = std::env::var("CLAW_INCLUDE_TOOL_GUIDANCE")
-        .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let _include_tool_guidance = std::env::var("CLAW_INCLUDE_TOOL_GUIDANCE")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
     let mut sections: Vec<String> = vec!["# Doing tasks".to_string()];
     sections.extend(items);

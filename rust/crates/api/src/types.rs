@@ -107,6 +107,12 @@ pub enum InputContentBlock {
     Text {
         text: String,
     },
+    /// Assistant reasoning / chain-of-thought. Replayed so a reasoning model
+    /// (glm45 / deepseek_v4 via vLLM) sees its own CoT across turns — only
+    /// produced when CLAW_PRESERVE_REASONING is set (see convert_messages).
+    /// For OpenAI-compat backends it is emitted as a top-level `reasoning` key
+    /// on the assistant message (translate_message), matching OpenHands'
+    /// interleaved-reasoning replay.
     Thinking {
         thinking: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,14 +128,6 @@ pub enum InputContentBlock {
         content: Vec<ToolResultContentBlock>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
-    },
-    /// Prior assistant reasoning / chain-of-thought, replayed so a reasoning model
-    /// (glm45 / deepseek_v4 via vLLM) sees its own CoT across turns. Only produced
-    /// when CLAW_PRESERVE_REASONING is set (see convert_messages); for OpenAI-compat
-    /// backends it is emitted as a top-level `reasoning` key on the assistant
-    /// message (translate_message), matching OpenHands' interleaved-reasoning replay.
-    Thinking {
-        text: String,
     },
 }
 

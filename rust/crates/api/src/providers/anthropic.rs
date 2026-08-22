@@ -1610,9 +1610,11 @@ mod tests {
             .request_profile()
             .render_json_body(&request)
             .expect("body should render");
+        // betas are communicated via the `anthropic-beta` header, so they never
+        // enter the body in the first place; the strip helper is belt-and-braces.
         assert!(
-            rendered.get("betas").is_some(),
-            "render_json_body still emits betas; the strip helper guards the wire format",
+            rendered.get("betas").is_none(),
+            "render_json_body must not emit betas into the request body",
         );
         super::strip_unsupported_beta_body_fields(&mut rendered);
 

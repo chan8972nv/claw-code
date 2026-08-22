@@ -28,6 +28,10 @@ pub struct ApiRequest {
 /// Streamed events emitted while processing a single assistant turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
+    /// Reasoning content for one thinking block. Also carries server-extracted
+    /// reasoning, emitted once per block when streaming completes. Persisted
+    /// into session JSONLs as `ContentBlock::Thinking` so reasoning can be
+    /// inspected per-instance offline.
     Thinking {
         thinking: String,
         signature: Option<String>,
@@ -38,11 +42,6 @@ pub enum AssistantEvent {
         name: String,
         input: String,
     },
-    /// Server-extracted reasoning content (full text per thinking block,
-    /// emitted once per block when streaming completes). Persisted into
-    /// session JSONLs as `ContentBlock::Thinking` so reasoning can be
-    /// inspected per-instance offline.
-    Thinking(String),
     Usage(TokenUsage),
     PromptCache(PromptCacheEvent),
     MessageStop,
@@ -753,24 +752,19 @@ fn build_assistant_message(
                 signature,
             } => {
                 flush_text_block(&mut text, &mut blocks);
-                blocks.push(ContentBlock::Thinking {
-                    thinking,
-                    signature,
-                });
+                // Empty thinking would clutter session JSONL and the Anthropic
+                // SDK rejects empty thinking content.
+                if !thinking.is_empty() {
+                    blocks.push(ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    });
+                }
             }
             AssistantEvent::TextDelta(delta) => text.push_str(&delta),
             AssistantEvent::ToolUse { id, name, input } => {
                 flush_text_block(&mut text, &mut blocks);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
-            }
-            AssistantEvent::Thinking(reasoning) => {
-                // Persist any in-flight text first so the saved order matches
-                // what the server actually emitted (text before reasoning is
-                // unusual but can happen when a parser reorders).
-                flush_text_block(&mut text, &mut blocks);
-                if !reasoning.is_empty() {
-                    blocks.push(ContentBlock::Thinking { text: reasoning });
-                }
             }
             AssistantEvent::Usage(value) => usage = Some(value),
             AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),
@@ -888,7 +882,10 @@ mod tests {
     #[test]
     fn build_assistant_message_persists_thinking_block() {
         let events = vec![
-            AssistantEvent::Thinking("the user is asking 2+2".to_string()),
+            AssistantEvent::Thinking {
+                thinking: "the user is asking 2+2".to_string(),
+                signature: None,
+            },
             AssistantEvent::TextDelta("Result: 4".to_string()),
             AssistantEvent::MessageStop,
         ];
@@ -897,7 +894,7 @@ mod tests {
         assert_eq!(msg.blocks.len(), 2);
         assert!(matches!(
             &msg.blocks[0],
-            ContentBlock::Thinking { text } if text == "the user is asking 2+2"
+            ContentBlock::Thinking { thinking, .. } if thinking == "the user is asking 2+2"
         ));
         assert!(matches!(
             &msg.blocks[1],
@@ -910,7 +907,10 @@ mod tests {
     #[test]
     fn build_assistant_message_drops_empty_thinking_block() {
         let events = vec![
-            AssistantEvent::Thinking(String::new()),
+            AssistantEvent::Thinking {
+                thinking: String::new(),
+                signature: None,
+            },
             AssistantEvent::TextDelta("hi".to_string()),
             AssistantEvent::MessageStop,
         ];

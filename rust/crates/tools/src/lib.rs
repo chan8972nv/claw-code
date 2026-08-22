@@ -2437,11 +2437,7 @@ fn run_read_file(input: ReadFileInput) -> Result<String, String> {
         output.file.total_lines,
     );
     for (i, line) in output.file.content.lines().enumerate() {
-        result.push_str(&format!(
-            "{}\t{}\n",
-            output.file.start_line + i,
-            line
-        ));
+        result.push_str(&format!("{}\t{}\n", output.file.start_line + i, line));
     }
     Ok(result)
 }
@@ -2449,13 +2445,18 @@ fn run_read_file(input: ReadFileInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    let output = write_file_in_workspace(&input.path, &input.content, &workspace)
-        .map_err(io_to_string)?;
+    let output =
+        write_file_in_workspace(&input.path, &input.content, &workspace).map_err(io_to_string)?;
     // Return a compact result instead of echoing back the full file content
     // and original file, which wastes thousands of tokens.
     Ok(format!(
-        "File {} successfully ({} lines).",
-        if output.kind == "create" { "created" } else { "updated" },
+        "File {} successfully: {} ({} lines).",
+        if output.kind == "create" {
+            "created"
+        } else {
+            "updated"
+        },
+        output.file_path,
         output.content.lines().count()
     ))
 }
@@ -2522,14 +2523,12 @@ fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
             );
             Ok(format!("{}{}", header, content))
         }
-        "count" => {
-            Ok(format!(
-                "Found {} matches in {} files\n\n{}",
-                output.num_matches.unwrap_or(0),
-                output.num_files,
-                output.filenames.join("\n")
-            ))
-        }
+        "count" => Ok(format!(
+            "Found {} matches in {} files\n\n{}",
+            output.num_matches.unwrap_or(0),
+            output.num_files,
+            output.filenames.join("\n")
+        )),
         _ => {
             // files_with_matches
             Ok(format!(
@@ -5345,11 +5344,6 @@ async fn stream_with_provider(
                 if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
                     events.push(AssistantEvent::ToolUse { id, name, input });
                 }
-                if let Some(reasoning) = pending_thinking.remove(&stop.index) {
-                    if !reasoning.is_empty() {
-                        events.push(AssistantEvent::Thinking(reasoning));
-                    }
-                }
             }
             ApiStreamEvent::MessageDelta(delta) => {
                 events.push(AssistantEvent::Usage(delta.usage.token_usage()));
@@ -5475,13 +5469,27 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     // through as an InputContentBlock::Thinking, which translate_message
                     // replays to OpenAI-compat backends as a top-level `reasoning` key
                     // on the assistant message (matches OpenHands' interleaved reasoning).
-                    ContentBlock::Thinking { text } => {
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => {
                         let preserve = matches!(
-                            std::env::var("CLAW_PRESERVE_REASONING").ok().as_deref().map(str::trim),
-                            Some("1") | Some("true") | Some("TRUE") | Some("True") | Some("yes") | Some("on")
+                            std::env::var("CLAW_PRESERVE_REASONING")
+                                .ok()
+                                .as_deref()
+                                .map(str::trim),
+                            Some("1")
+                                | Some("true")
+                                | Some("TRUE")
+                                | Some("True")
+                                | Some("yes")
+                                | Some("on")
                         );
-                        if preserve && !text.trim().is_empty() {
-                            Some(InputContentBlock::Thinking { text: text.clone() })
+                        if preserve && !thinking.trim().is_empty() {
+                            Some(InputContentBlock::Thinking {
+                                thinking: thinking.clone(),
+                                signature: signature.clone(),
+                            })
                         } else {
                             None
                         }
@@ -5558,11 +5566,6 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
         );
         if let Some((id, name, input)) = pending_tools.remove(&index) {
             events.push(AssistantEvent::ToolUse { id, name, input });
-        }
-        if let Some(reasoning) = pending_thinking.remove(&index) {
-            if !reasoning.is_empty() {
-                events.push(AssistantEvent::Thinking(reasoning));
-            }
         }
     }
 
@@ -6313,8 +6316,7 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
 fn regex_lite_python_dash_c(line: &str) -> bool {
     for prefix in ["python3 -c", "python -c"] {
         if let Some(idx) = line.find(prefix) {
-            let before_ok = idx == 0
-                || line.as_bytes()[idx - 1].is_ascii_whitespace();
+            let before_ok = idx == 0 || line.as_bytes()[idx - 1].is_ascii_whitespace();
             let after = &line[idx + prefix.len()..];
             let after_ok = after
                 .chars()
@@ -7056,8 +7058,7 @@ mod tests {
         assert!(!names.contains(&"Sleep"));
         assert!(!names.contains(&"SendUserMessage"));
         assert!(
-            std::env::var("CLAW_ENABLE_REPL").as_deref() == Ok("1")
-                || !names.contains(&"REPL"),
+            std::env::var("CLAW_ENABLE_REPL").as_deref() == Ok("1") || !names.contains(&"REPL"),
             "REPL should only appear when CLAW_ENABLE_REPL=1",
         );
         assert!(!names.contains(&"PowerShell"));
@@ -9761,7 +9762,8 @@ mod tests {
     fn bash_tool_classifies_test_timeout_as_hung_with_provenance() {
         let timeout = execute_tool(
             "bash",
-            &json!({ "command": "sleep 1 # cargo test slow_case", "timeout": 10 }),
+            // timeout <= 1000 is interpreted as seconds, so this is a 1s cap
+            &json!({ "command": "sleep 5 # cargo test slow_case", "timeout": 1 }),
         )
         .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");

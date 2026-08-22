@@ -721,17 +721,14 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
             }
         }
         // Trim trailing equals beyond context.
-        while end > start
-            && matches!(ops[end - 1], DiffOp::Equal(..))
-            && {
-                let trailing_count = ops[..end]
-                    .iter()
-                    .rev()
-                    .take_while(|op| matches!(op, DiffOp::Equal(..)))
-                    .count();
-                trailing_count > ctx
-            }
-        {
+        while end > start && matches!(ops[end - 1], DiffOp::Equal(..)) && {
+            let trailing_count = ops[..end]
+                .iter()
+                .rev()
+                .take_while(|op| matches!(op, DiffOp::Equal(..)))
+                .count();
+            trailing_count > ctx
+        } {
             end -= 1;
         }
 
@@ -757,7 +754,11 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
                 DiffOp::Remove(o) => {
                     if first {
                         old_start = o + 1;
-                        new_start = if o < new_lines.len() { o + 1 } else { new_lines.len() + 1 };
+                        new_start = if o < new_lines.len() {
+                            o + 1
+                        } else {
+                            new_lines.len() + 1
+                        };
                         first = false;
                     }
                     hunk_lines.push(format!("-{}", old_lines[o]));
@@ -765,7 +766,11 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
                 }
                 DiffOp::Add(n) => {
                     if first {
-                        old_start = if n < old_lines.len() { n + 1 } else { old_lines.len() + 1 };
+                        old_start = if n < old_lines.len() {
+                            n + 1
+                        } else {
+                            old_lines.len() + 1
+                        };
                         new_start = n + 1;
                         first = false;
                     }
@@ -871,8 +876,7 @@ fn lcs_diff_simple<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<(usize, usize)> 
 
     // Match suffix.
     let mut suffix = 0;
-    while suffix < m - prefix && suffix < n - prefix && old[m - 1 - suffix] == new[n - 1 - suffix]
-    {
+    while suffix < m - prefix && suffix < n - prefix && old[m - 1 - suffix] == new[n - 1 - suffix] {
         suffix += 1;
     }
 

@@ -4847,7 +4847,7 @@ fn solve_problem(
     eprintln!("[solve] Starting solve mode with max_iterations={max_iterations}");
     eprintln!("[solve] Problem length: {} chars", problem_text.len());
 
-    let system_prompt = build_system_prompt()?;
+    let system_prompt = build_system_prompt(&model)?;
     let session_id = format!(
         "solve-{}",
         std::time::SystemTime::now()
@@ -14503,13 +14503,27 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     // prior CoT through as an InputContentBlock::Thinking, which
                     // translate_message replays as a top-level `reasoning` key on the
                     // assistant message (matches OpenHands). See convert_messages in tools.
-                    ContentBlock::Thinking { text } => {
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => {
                         let preserve = matches!(
-                            std::env::var("CLAW_PRESERVE_REASONING").ok().as_deref().map(str::trim),
-                            Some("1") | Some("true") | Some("TRUE") | Some("True") | Some("yes") | Some("on")
+                            std::env::var("CLAW_PRESERVE_REASONING")
+                                .ok()
+                                .as_deref()
+                                .map(str::trim),
+                            Some("1")
+                                | Some("true")
+                                | Some("TRUE")
+                                | Some("True")
+                                | Some("yes")
+                                | Some("on")
                         );
-                        if preserve && !text.trim().is_empty() {
-                            Some(InputContentBlock::Thinking { text: text.clone() })
+                        if preserve && !thinking.trim().is_empty() {
+                            Some(InputContentBlock::Thinking {
+                                thinking: thinking.clone(),
+                                signature: signature.clone(),
+                            })
                         } else {
                             None
                         }
@@ -14604,10 +14618,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  claw solve [--problem-file FILE] [--max-iterations N] [--output-file FILE] [--session-dir DIR] [PROBLEM...]"
     )?;
-    writeln!(
-        out,
-        "      Run headless solve mode for evaluation"
-    )?;
+    writeln!(out, "      Run headless solve mode for evaluation")?;
     writeln!(out)?;
     writeln!(out, "Flags:")?;
     writeln!(

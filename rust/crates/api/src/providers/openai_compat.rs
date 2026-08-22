@@ -683,7 +683,8 @@ impl StreamState {
                     for state in self.tool_calls.values_mut() {
                         if state.started && !state.stopped {
                             if self.dsml_mode {
-                                if let Some(coerced) = state.coerced_delta_event(tool_index_offset) {
+                                if let Some(coerced) = state.coerced_delta_event(tool_index_offset)
+                                {
                                     events.push(StreamEvent::ContentBlockDelta(coerced));
                                 }
                             }
@@ -793,8 +794,7 @@ impl StreamState {
                     } else {
                         state.delta_event(tool_index_offset)
                     };
-                    if let Some(mut delta_event) = delta {
-                        delta_event.index = block_index;
+                    if let Some(delta_event) = delta {
                         events.push(StreamEvent::ContentBlockDelta(delta_event));
                     }
                 }
@@ -982,8 +982,6 @@ struct ChatMessage {
     /// the extracted reasoning here. Without this field the deserializer would
     /// silently drop it, leaving sessions without any record of the model's
     /// thinking even though the server-side parsing happened correctly.
-    #[serde(default)]
-    reasoning_content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
@@ -1773,9 +1771,7 @@ fn normalize_response(
         // If DSML tool calls were extracted, signal tool_use so the agent loop
         // dispatches them — sglang's native finish_reason is "stop" when the
         // tool calls are emitted as in-band special tokens.
-        Some(reason) if dsml_tool_use_count > 0 && reason == "stop" => {
-            Some("tool_use".to_string())
-        }
+        Some(reason) if dsml_tool_use_count > 0 && reason == "stop" => Some("tool_use".to_string()),
         Some(reason) => Some(normalize_finish_reason(&reason)),
         None if dsml_tool_use_count > 0 => Some("tool_use".to_string()),
         None => None,
@@ -2466,9 +2462,14 @@ Let me search for the function.
         assert_eq!(parsed.tool_uses[0].name, "read_file");
         assert_eq!(
             parsed.tool_uses[0].input.get("path"),
-            Some(&Value::String("/testbed/django/db/models/manager.py".into())),
+            Some(&Value::String(
+                "/testbed/django/db/models/manager.py".into()
+            )),
         );
-        assert_eq!(parsed.cleaned_text.trim(), "Let me start by searching for the relevant code.");
+        assert_eq!(
+            parsed.cleaned_text.trim(),
+            "Let me start by searching for the relevant code."
+        );
     }
 
     #[test]
@@ -2486,8 +2487,7 @@ Let me search for the function.
     #[test]
     fn translate_dsml_returns_none_for_empty_block() {
         // Opener with no invokes — preserve text rather than silently dropping.
-        let text =
-            "<\u{ff5c}DSML\u{ff5c}tool_calls></\u{ff5c}DSML\u{ff5c}tool_calls>";
+        let text = "<\u{ff5c}DSML\u{ff5c}tool_calls></\u{ff5c}DSML\u{ff5c}tool_calls>";
         assert!(translate_dsml_tool_calls(text, "id").is_none());
     }
 
@@ -2533,7 +2533,8 @@ Let me search for the function.
     #[test]
     fn coerce_dsml_arg_strings_converts_quoted_object_literal() {
         use super::coerce_dsml_arg_strings;
-        let mut v: Value = serde_json::from_str(r#"{"opts": "{\"-v\": true, \"limit\": 3}"}"#).unwrap();
+        let mut v: Value =
+            serde_json::from_str(r#"{"opts": "{\"-v\": true, \"limit\": 3}"}"#).unwrap();
         coerce_dsml_arg_strings(&mut v);
         let obj = v.get("opts").and_then(Value::as_object).expect("object");
         assert_eq!(obj.get("-v"), Some(&Value::Bool(true)));
@@ -2556,8 +2557,7 @@ Let me search for the function.
         // Edge case: a string that starts with `{` but isn't valid JSON
         // (e.g., a regex pattern or template). Must remain a string.
         use super::coerce_dsml_arg_strings;
-        let mut v: Value =
-            serde_json::from_str(r#"{"pattern": "{not valid json"}"#).unwrap();
+        let mut v: Value = serde_json::from_str(r#"{"pattern": "{not valid json"}"#).unwrap();
         coerce_dsml_arg_strings(&mut v);
         assert_eq!(
             v.get("pattern"),
@@ -2617,7 +2617,6 @@ Let me search for the function.
         let parsed = translate_dsml_tool_calls(text, "id").expect("DSML extraction");
         assert_eq!(parsed.cleaned_text, "before  after");
     }
-
 
     #[test]
     fn request_translation_uses_openai_compatible_shape() {
@@ -3406,16 +3405,15 @@ Let me search for the function.
             max_tokens: 100,
             messages: vec![InputMessage {
                 role: "user".to_string(),
-                content: vec![InputContentBlock::Text { text: "hi".to_string() }],
+                content: vec![InputContentBlock::Text {
+                    text: "hi".to_string(),
+                }],
             }],
             stream: false,
             ..Default::default()
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
-        assert_eq!(
-            payload["chat_template_kwargs"],
-            json!({"thinking": true})
-        );
+        assert_eq!(payload["chat_template_kwargs"], json!({"thinking": true}));
 
         std::env::remove_var("CLAW_CHAT_TEMPLATE_KWARGS_THINKING");
     }
@@ -3436,7 +3434,9 @@ Let me search for the function.
             max_tokens: 100,
             messages: vec![InputMessage {
                 role: "user".to_string(),
-                content: vec![InputContentBlock::Text { text: "hi".to_string() }],
+                content: vec![InputContentBlock::Text {
+                    text: "hi".to_string(),
+                }],
             }],
             stream: false,
             ..Default::default()
@@ -3469,13 +3469,14 @@ Let me search for the function.
                 max_tokens: 100,
                 messages: vec![InputMessage {
                     role: "user".to_string(),
-                    content: vec![InputContentBlock::Text { text: "hi".to_string() }],
+                    content: vec![InputContentBlock::Text {
+                        text: "hi".to_string(),
+                    }],
                 }],
                 stream: false,
                 ..Default::default()
             };
-            let payload =
-                build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+            let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
             assert!(
                 payload.get("chat_template_kwargs").is_none(),
                 "model {model} must omit chat_template_kwargs when no env var is set"
@@ -3502,7 +3503,9 @@ Let me search for the function.
             max_tokens: 100,
             messages: vec![InputMessage {
                 role: "user".to_string(),
-                content: vec![InputContentBlock::Text { text: "hi".to_string() }],
+                content: vec![InputContentBlock::Text {
+                    text: "hi".to_string(),
+                }],
             }],
             stream: false,
             ..Default::default()
@@ -3960,7 +3963,10 @@ Let me search for the function.
         let resp = super::normalize_response("deepseek-v4-flash", parsed).unwrap();
 
         // Order: Thinking before Text.
-        assert!(matches!(resp.content[0], OutputContentBlock::Thinking { .. }));
+        assert!(matches!(
+            resp.content[0],
+            OutputContentBlock::Thinking { .. }
+        ));
         if let OutputContentBlock::Thinking { thinking, .. } = &resp.content[0] {
             assert_eq!(thinking, "User asks 2+2. Add the numbers.");
         }
@@ -3992,7 +3998,10 @@ Let me search for the function.
         let parsed: super::ChatCompletionResponse = serde_json::from_value(body).unwrap();
         let resp = super::normalize_response("gpt-4o", parsed).unwrap();
         assert!(
-            !resp.content.iter().any(|b| matches!(b, OutputContentBlock::Thinking { .. })),
+            !resp
+                .content
+                .iter()
+                .any(|b| matches!(b, OutputContentBlock::Thinking { .. })),
             "whitespace-only reasoning_content must not produce a Thinking block"
         );
     }
@@ -4002,9 +4011,7 @@ Let me search for the function.
     /// `ThinkingDelta` events. Subsequent text chunks shift to index 1.
     #[test]
     fn stream_state_emits_thinking_block_for_reasoning_content_delta() {
-        use crate::types::{
-            ContentBlockDelta, OutputContentBlock, StreamEvent,
-        };
+        use crate::types::{ContentBlockDelta, OutputContentBlock, StreamEvent};
         let mut state = super::StreamState::new("deepseek-v4-flash".to_string());
         // Force out of dsml_mode for this test — reasoning delta should work
         // regardless, but we want a clean text path on the same chunk stream.
@@ -4018,7 +4025,8 @@ Let me search for the function.
                 "delta": {"reasoning_content": "Let me think..."},
                 "finish_reason": null
             }]
-        })).unwrap();
+        }))
+        .unwrap();
         let events = state.ingest_chunk(chunk1).unwrap();
 
         let starts: Vec<_> = events
@@ -4030,7 +4038,10 @@ Let me search for the function.
             .collect();
         assert_eq!(starts.len(), 1);
         assert_eq!(starts[0].index, 0);
-        assert!(matches!(starts[0].content_block, OutputContentBlock::Thinking { .. }));
+        assert!(matches!(
+            starts[0].content_block,
+            OutputContentBlock::Thinking { .. }
+        ));
 
         let deltas: Vec<_> = events
             .iter()
@@ -4055,7 +4066,8 @@ Let me search for the function.
                 "delta": {"content": "Answer: 42."},
                 "finish_reason": null
             }]
-        })).unwrap();
+        }))
+        .unwrap();
         let events2 = state.ingest_chunk(chunk2).unwrap();
 
         let stops: Vec<_> = events2
@@ -4075,8 +4087,14 @@ Let me search for the function.
             })
             .collect();
         assert_eq!(starts2.len(), 1);
-        assert_eq!(starts2[0].index, 1, "text block must shift to index 1 after reasoning");
-        assert!(matches!(starts2[0].content_block, OutputContentBlock::Text { .. }));
+        assert_eq!(
+            starts2[0].index, 1,
+            "text block must shift to index 1 after reasoning"
+        );
+        assert!(matches!(
+            starts2[0].content_block,
+            OutputContentBlock::Text { .. }
+        ));
     }
 
     /// Without any reasoning, indices stay at the legacy values (text=0,
@@ -4093,7 +4111,8 @@ Let me search for the function.
                 "delta": {"content": "hi"},
                 "finish_reason": null
             }]
-        })).unwrap();
+        }))
+        .unwrap();
         let events = state.ingest_chunk(chunk).unwrap();
         let starts: Vec<_> = events
             .iter()
@@ -4104,6 +4123,9 @@ Let me search for the function.
             .collect();
         assert_eq!(starts.len(), 1);
         assert_eq!(starts[0].index, 0);
-        assert!(matches!(starts[0].content_block, OutputContentBlock::Text { .. }));
+        assert!(matches!(
+            starts[0].content_block,
+            OutputContentBlock::Text { .. }
+        ));
     }
 }

@@ -1065,6 +1065,18 @@ fn unique_message_id() -> String {
 }
 
 fn extract_read_content(tool_output: &str) -> String {
+    // Try plain-text format first:
+    //   "<path> (lines 1-3 of 3)\n1\tfirst\n2\tsecond\n..."
+    if let Some((header, body)) = tool_output.split_once('\n') {
+        if header.contains(" (lines ") && header.ends_with(')') {
+            return body
+                .lines()
+                .map(|line| line.split_once('\t').map_or(line, |(_, rest)| rest))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
+    // Fall back to legacy JSON format
     serde_json::from_str::<Value>(tool_output)
         .ok()
         .and_then(|value| {
@@ -1106,6 +1118,16 @@ fn extract_file_path(tool_output: &str) -> String {
     // Try read_file format: "/path/to/file (lines ...)"
     if let Some(paren_pos) = tool_output.find(" (lines ") {
         return tool_output[..paren_pos].to_string();
+    }
+    // Try write_file format: "File created successfully: /path/to/file (N lines)."
+    if tool_output.starts_with("File created successfully: ")
+        || tool_output.starts_with("File updated successfully: ")
+    {
+        if let Some(rest) = tool_output.split_once(": ").map(|(_, rest)| rest) {
+            if let Some(paren_pos) = rest.rfind(" (") {
+                return rest[..paren_pos].to_string();
+            }
+        }
     }
     // Fall back to legacy JSON format
     serde_json::from_str::<Value>(tool_output)
