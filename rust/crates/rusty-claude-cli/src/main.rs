@@ -13026,6 +13026,37 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
 
+/// Error carrier for one streaming attempt. `retryable` mirrors
+/// `ApiError::is_retryable`; `received_any_event` gates whole-request retries
+/// to attempts that surfaced NOTHING, so a retry can never duplicate output.
+struct StreamAttemptFailure {
+    error: RuntimeError,
+    retryable: bool,
+    received_any_event: bool,
+}
+
+impl From<RuntimeError> for StreamAttemptFailure {
+    fn from(error: RuntimeError) -> Self {
+        // Conservative default for non-API failures (I/O, rendering): never retry.
+        Self {
+            error,
+            retryable: false,
+            received_any_event: true,
+        }
+    }
+}
+
+/// Whole-request retries for retryable API errors that occur before any
+/// stream event arrives (connect refused, timeout, body/SSE decode from a
+/// server under load). Mirrors the ProviderRuntimeClient retry in tools —
+/// this impl is the one solve mode actually uses.
+const CLI_STREAM_ATTEMPT_RETRIES: u32 = 3;
+
+fn cli_stream_retry_backoff(attempt: u32) -> std::time::Duration {
+    // 2s, 4s, 8s.
+    std::time::Duration::from_secs(2u64 << (attempt.saturating_sub(1)).min(4))
+}
+
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -13055,21 +13086,44 @@ impl ApiClient for AnthropicRuntimeClient {
             // deadline we drop the stalled connection and re-send the request as
             // a continuation nudge (one retry only).
             let max_attempts: usize = if is_post_tool { 2 } else { 1 };
+            let mut retries = 0u32;
 
             for attempt in 1..=max_attempts {
-                let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
-                    .await;
-                match result {
-                    Ok(events) => return Ok(events),
-                    Err(error)
-                        if error.to_string().contains("post-tool stall")
-                            && attempt < max_attempts =>
-                    {
-                        // Stalled after tool completion — nudge the model by
-                        // re-sending the same request.
+                loop {
+                    let result = self
+                        .consume_stream(&message_request, is_post_tool && attempt == 1)
+                        .await;
+                    match result {
+                        Ok(events) => return Ok(events),
+                        // Retryable API failure: replay the identical stateless
+                        // request after a short backoff instead of aborting the
+                        // whole turn. Safe when nothing was surfaced yet, and
+                        // always safe in headless mode (emit_output=false — the
+                        // partial event Vec is discarded, nothing was printed).
+                        // Interactive mode keeps the no-partial-output gate so a
+                        // retry can never print the same text twice.
+                        Err(failure)
+                            if failure.retryable
+                                && (!failure.received_any_event || !self.emit_output)
+                                && retries < CLI_STREAM_ATTEMPT_RETRIES =>
+                        {
+                            retries += 1;
+                            eprintln!(
+                                "stream attempt failed with retryable error (retry {retries}/{CLI_STREAM_ATTEMPT_RETRIES}): {}",
+                                failure.error
+                            );
+                            tokio::time::sleep(cli_stream_retry_backoff(retries)).await;
+                        }
+                        Err(failure)
+                            if failure.error.to_string().contains("post-tool stall")
+                                && attempt < max_attempts =>
+                        {
+                            // Stalled after tool completion — nudge the model by
+                            // re-sending the same request.
+                            break;
+                        }
+                        Err(failure) => return Err(failure.error),
                     }
-                    Err(error) => return Err(error),
                 }
             }
 
@@ -13086,13 +13140,15 @@ impl AnthropicRuntimeClient {
         &self,
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
-    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+    ) -> Result<Vec<AssistantEvent>, StreamAttemptFailure> {
         let mut stream = self
             .client
             .stream_message(message_request)
             .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+            .map_err(|error| StreamAttemptFailure {
+                retryable: error.is_retryable(),
+                received_any_event: false,
+                error: RuntimeError::new(format_user_visible_api_error(&self.session_id, &error)),
             })?;
         let mut stdout = io::stdout();
         let mut sink = io::sink();
@@ -13114,19 +13170,32 @@ impl AnthropicRuntimeClient {
         loop {
             let next = if apply_stall_timeout && !received_any_event {
                 match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
-                    Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                    Ok(inner) => inner.map_err(|error| StreamAttemptFailure {
+                        retryable: error.is_retryable(),
+                        received_any_event,
+                        error: RuntimeError::new(format_user_visible_api_error(
+                            &self.session_id,
+                            &error,
+                        )),
                     })?,
                     Err(_elapsed) => {
-                        return Err(RuntimeError::new(
+                        return Err(StreamAttemptFailure::from(RuntimeError::new(
                             "post-tool stall: model did not respond within timeout",
-                        ));
+                        )));
                     }
                 }
             } else {
-                stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?
+                stream
+                    .next_event()
+                    .await
+                    .map_err(|error| StreamAttemptFailure {
+                        retryable: error.is_retryable(),
+                        received_any_event,
+                        error: RuntimeError::new(format_user_visible_api_error(
+                            &self.session_id,
+                            &error,
+                        )),
+                    })?
             };
 
             let Some(event) = next else {

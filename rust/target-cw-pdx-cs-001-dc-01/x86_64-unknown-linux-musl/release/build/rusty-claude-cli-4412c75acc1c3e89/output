@@ -1,0 +1,12 @@
+cargo:rustc-env=GIT_SHA=188f53d15d39f5348806c58d530a7013dd003431
+cargo:rustc-env=GIT_SHA_SHORT=188f53d15d39
+cargo:rustc-env=GIT_DIRTY=true
+cargo:rustc-env=GIT_BRANCH=ck/dev2
+cargo:rustc-env=GIT_COMMIT_DATE=2026-08-21T20:31:15-07:00
+cargo:rustc-env=GIT_COMMIT_TIMESTAMP=1787369475
+cargo:rustc-env=RUSTC_VERSION=rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo:rustc-env=TARGET=x86_64-unknown-linux-musl
+cargo:rustc-env=BUILD_DATE=2026-08-21
+cargo:rerun-if-changed=../../../.git/HEAD
+cargo:rerun-if-changed=../../../.git/refs
+cargo:rerun-if-changed=../../../.git/index
