@@ -734,22 +734,13 @@ fn get_simple_doing_tasks_section() -> String {
         // --- Exploration and scope ---
         "Read relevant code before changing it. If you find yourself reading the same file a third time, page through it with `read_file` offsets instead of restarting from the top — repeated whole-file reads waste context and rarely surface anything new.".to_string(),
         "Keep changes tightly scoped to the request. Do not add speculative abstractions, compatibility shims, unrelated refactors, or new files unless the task genuinely requires them.".to_string(),
-        "Do not modify packaging or build metadata (`setup.py`, `setup.cfg`, `pyproject.toml`, `requirements.txt`, `tox.ini`, CI configs) unless the issue is explicitly about packaging. Environment workarounds belong in the harness, not in the patch.".to_string(),
         // --- Diagnosis and fix layer ---
-        "Before editing, trace the bug to its root cause and fix where the problem originates (utility, base class, data layer), not where the symptom appears (caller, formatter, view). If the same bug could surface from any other caller, you are at the wrong layer — name the deepest function that already implements the buggy behavior and fix it there.".to_string(),
         "When the issue says existing behavior is wrong, replace it. Do not preserve both branches via `or fallback_to_old` or `if old: ... else:`, and do not introduce a parallel dispatch hook alongside the canonical method — override the canonical method itself.".to_string(),
         "Check how similar patterns are handled elsewhere in the codebase. If the same idiom appears in multiple places, match it exactly rather than inventing a new shape.".to_string(),
-        "Prefer the smallest fix that resolves the root cause. Patch size is not a quality signal — a small fix in the wrong layer is worse than a larger fix at the right one — but if you are changing more than ~15 lines, pause and reconsider whether you are fixing the right thing.".to_string(),
-        // --- Tests and verification ---
-        "Never modify test files to make them match your fix. The existing tests must pass against your code change as-is. Adding a brand-new test that demonstrates the fix is fine; loosening or deleting existing assertions is not.".to_string(),
-        "Before declaring the task complete, run the project's own test runner against (a) the specific failing test(s) named in the issue and (b) every other test in the same module or file — not a custom inline script. If you have not executed those tests in the current state of the repo, say so explicitly rather than claiming success.".to_string(),
-        // --- Loop / thrash control ---
-        "If two consecutive edits to the same file fail to fix the issue, stop editing. Re-read the failing test verbatim, write a small reproducer that compares observed vs. expected output, and articulate the gap in one sentence before attempting a third edit. Random-walking between tactics wastes turns and rarely converges.".to_string(),
         // --- Tool result hygiene ---
         "Tool results larger than ~50 KB are a red flag — narrow the search with file-type filters, line-range limits, or `head` before processing. Never paste raw, unfiltered tool output into your reasoning.".to_string(),
         "If the conversation has been compacted, trust the summary and resume from where you left off. Re-read only the specific line ranges you have not seen — do not start the investigation over from the top of files you already explored.".to_string(),
         // --- Reporting ---
-        "Never submit an empty patch. If your best attempt regresses some tests, keep the partial fix and explain the trade-off in your final summary; do not revert to the original state.".to_string(),
         "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
         "Report outcomes faithfully: if verification failed or was not run, say so explicitly.".to_string(),
     ]);

@@ -4826,6 +4826,47 @@ fn parse_solve_args(args: &[String], model: String) -> Result<CliAction, String>
     })
 }
 
+/// Curated tool surface for headless solve mode. The registry holds ~50 tools
+/// (Worker*/Team*/Cron*/AskUserQuestion/...), and passing `None` shipped every
+/// schema to the model on every request — ~30 KB of context and an action
+/// space 48x wider than mini-swe-agent's single bash tool, for a model whose
+/// SWE-bench trajectories only ever used a dozen. Names are canonical
+/// (snake_case). Override with CLAW_SOLVE_ALLOWED_TOOLS (colon/comma-separated
+/// tool names; the literal `all` restores the old expose-everything behavior).
+/// REPL is listed but only surfaces when CLAW_ENABLE_REPL=1 registers it.
+fn solve_allowed_tools() -> Option<AllowedToolSet> {
+    if let Ok(raw) = std::env::var("CLAW_SOLVE_ALLOWED_TOOLS") {
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("all") {
+            return None;
+        }
+        if !raw.is_empty() {
+            return Some(
+                raw.split([':', ','])
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .map(canonical_allowed_tool_name)
+                    .collect(),
+            );
+        }
+    }
+    Some(
+        [
+            "bash",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "glob_search",
+            "grep_search",
+            "todo_write",
+            "repl",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    )
+}
+
 /// Nudge injected when a solve session ends cleanly with an empty diff.
 /// mini-swe-agent structurally prevents no-edit endings (every response must
 /// carry a tool call); claw's loop ends on any no-tool-call turn, which turned
@@ -4973,7 +5014,7 @@ fn solve_problem(
         system_prompt,
         true,
         false, // emit_output = false for headless mode
-        None,
+        solve_allowed_tools(),
         PermissionMode::DangerFullAccess,
         None,
     )?;
@@ -15008,6 +15049,27 @@ mod tests {
         std::env::remove_var("CLAW_PATCH_EXCLUDE_GLOBS");
         std::env::set_current_dir(original).expect("restore cwd");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn solve_allowed_tools_defaults_curated_and_honors_override() {
+        let _lock = env_lock();
+        std::env::remove_var("CLAW_SOLVE_ALLOWED_TOOLS");
+        let default = super::solve_allowed_tools().expect("curated default");
+        assert!(default.contains("bash"));
+        assert!(default.contains("edit_file"));
+        assert!(default.contains("todo_write"));
+        assert!(!default.contains("worker_create"));
+        assert!(!default.contains("ask_user_question"));
+
+        std::env::set_var("CLAW_SOLVE_ALLOWED_TOOLS", "bash, GitDiff:read_file");
+        let custom = super::solve_allowed_tools().expect("override set");
+        assert_eq!(custom.len(), 3);
+        assert!(custom.contains("git_diff"), "names are canonicalized");
+
+        std::env::set_var("CLAW_SOLVE_ALLOWED_TOOLS", "all");
+        assert!(super::solve_allowed_tools().is_none(), "all = old behavior");
+        std::env::remove_var("CLAW_SOLVE_ALLOWED_TOOLS");
     }
 
     #[test]
