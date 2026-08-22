@@ -234,9 +234,7 @@ impl OpenAiCompatClient {
         request.model = canonical;
 
         preflight_message_request(&request)?;
-        let response = self.send_with_retry(&request).await?;
-        let request_id = request_id_from_headers(response.headers());
-        let body = response.text().await.map_err(ApiError::from)?;
+        let (request_id, body) = self.send_with_retry_text(&request).await?;
         if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body) {
             if let Some(err_obj) = raw.get("error") {
                 let msg = err_obj
@@ -318,6 +316,57 @@ impl OpenAiCompatClient {
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
                     Err(error) => return Err(error),
                 },
+                Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
+                Err(error) => return Err(error),
+            };
+
+            if attempts > self.max_retries {
+                break retryable_error;
+            }
+
+            let delay = if let Some(retry_after) = retryable_error.retry_after() {
+                retry_after
+            } else {
+                self.jittered_backoff_for_attempt(attempts)?
+            };
+            tokio::time::sleep(delay).await;
+        };
+
+        Err(ApiError::RetriesExhausted {
+            attempts,
+            last_error: Box::new(last_error),
+        })
+    }
+
+    /// Like [`send_with_retry`], but also reads the response body inside the
+    /// retry loop. `reqwest::Error::is_decode()`/`is_body()` failures happen at
+    /// body-read time, AFTER the response headers arrive — reading the body
+    /// outside the loop made that whole retryable class fatal on the first
+    /// attempt (observed as `http error: error decoding response body` when a
+    /// server under load truncates a response).
+    async fn send_with_retry_text(
+        &self,
+        request: &MessageRequest,
+    ) -> Result<(Option<String>, String), ApiError> {
+        let mut attempts = 0;
+
+        let last_error = loop {
+            attempts += 1;
+            let attempt_result = match self.send_raw_request(request).await {
+                Ok(response) => match expect_success(response).await {
+                    Ok(response) => {
+                        let request_id = request_id_from_headers(response.headers());
+                        match response.text().await.map_err(ApiError::from) {
+                            Ok(body) => return Ok((request_id, body)),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+            let retryable_error = match attempt_result {
+                Ok(value) => return Ok(value),
                 Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
                 Err(error) => return Err(error),
             };
@@ -532,6 +581,12 @@ struct StreamState {
     /// markup; the markup spans multiple chunks and must be parsed whole.
     dsml_mode: bool,
     dsml_text_buffer: String,
+    /// DSML models sometimes emit their tool-call markup inside the REASONING
+    /// stream (`delta.reasoning_content`) rather than `delta.content`. Buffer
+    /// reasoning the same way as text so finish() can extract those calls —
+    /// emitting raw ThinkingDeltas would silently drop them (the agent loop
+    /// never parses tool calls out of thinking blocks).
+    dsml_reasoning_buffer: String,
     dsml_message_id: String,
 }
 
@@ -551,6 +606,7 @@ impl StreamState {
             thinking_finished: false,
             dsml_mode,
             dsml_text_buffer: String::new(),
+            dsml_reasoning_buffer: String::new(),
             dsml_message_id: String::new(),
         }
     }
@@ -598,22 +654,29 @@ impl StreamState {
                     .and_then(|t| t.content)
                     .filter(|value| !value.is_empty()))
             {
-                if !self.thinking_started {
-                    self.thinking_started = true;
-                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                if self.dsml_mode {
+                    // Hold reasoning until finish; DSML markup can span chunks
+                    // and may carry tool calls that must be extracted, not
+                    // surfaced as thinking prose.
+                    self.dsml_reasoning_buffer.push_str(&reasoning);
+                } else {
+                    if !self.thinking_started {
+                        self.thinking_started = true;
+                        events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                            index: 0,
+                            content_block: OutputContentBlock::Thinking {
+                                thinking: String::new(),
+                                signature: None,
+                            },
+                        }));
+                    }
+                    events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                         index: 0,
-                        content_block: OutputContentBlock::Thinking {
-                            thinking: String::new(),
-                            signature: None,
+                        delta: ContentBlockDelta::ThinkingDelta {
+                            thinking: reasoning,
                         },
                     }));
                 }
-                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
-                    delta: ContentBlockDelta::ThinkingDelta {
-                        thinking: reasoning,
-                    },
-                }));
             }
 
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
@@ -715,12 +778,6 @@ impl StreamState {
                 index: self.text_block_index(),
             }));
         }
-        if self.text_started && !self.text_finished {
-            self.text_finished = true;
-            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: self.text_block_index(),
-            }));
-        }
 
         // DSML mode: flush the buffered text now, parsing tool calls out of it
         // and synthesizing the equivalent ContentBlock events. Block indices
@@ -728,6 +785,58 @@ impl StreamState {
         // suppressed all text events during streaming.
         let mut dsml_next_index = self.text_block_index();
         let mut dsml_extracted_tool_uses = false;
+        if self.dsml_mode && !self.dsml_reasoning_buffer.is_empty() {
+            let id_prefix = format!("toolu_dsml_think_{}", self.dsml_message_id);
+            let buffer = std::mem::take(&mut self.dsml_reasoning_buffer);
+            let (cleaned_reasoning, tool_uses) =
+                match translate_dsml_tool_calls(&buffer, &id_prefix) {
+                    Some(parsed) => (parsed.cleaned_text, parsed.tool_uses),
+                    None => (buffer, Vec::new()),
+                };
+            let trimmed = cleaned_reasoning.trim();
+            if !trimmed.is_empty() {
+                events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                    index: dsml_next_index,
+                    content_block: OutputContentBlock::Thinking {
+                        thinking: String::new(),
+                        signature: None,
+                    },
+                }));
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: dsml_next_index,
+                    delta: ContentBlockDelta::ThinkingDelta {
+                        thinking: trimmed.to_string(),
+                    },
+                }));
+                events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                    index: dsml_next_index,
+                }));
+                dsml_next_index += 1;
+            }
+            for tool_use in tool_uses {
+                dsml_extracted_tool_uses = true;
+                events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                    index: dsml_next_index,
+                    content_block: OutputContentBlock::ToolUse {
+                        id: tool_use.id,
+                        name: tool_use.name,
+                        input: json!({}),
+                    },
+                }));
+                let json_str =
+                    serde_json::to_string(&tool_use.input).unwrap_or_else(|_| "{}".to_string());
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: dsml_next_index,
+                    delta: ContentBlockDelta::InputJsonDelta {
+                        partial_json: json_str,
+                    },
+                }));
+                events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                    index: dsml_next_index,
+                }));
+                dsml_next_index += 1;
+            }
+        }
         if self.dsml_mode && !self.dsml_text_buffer.is_empty() {
             let id_prefix = format!("toolu_dsml_{}", self.dsml_message_id);
             let buffer = std::mem::take(&mut self.dsml_text_buffer);
@@ -1709,6 +1818,8 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
+    let dsml_model = model_emits_dsml_tool_calls(model);
+    let mut dsml_tool_use_count = 0usize;
     if let Some(thinking) = choice
         .message
         .reasoning_content
@@ -1717,14 +1828,40 @@ fn normalize_response(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
-        content.push(OutputContentBlock::Thinking {
-            thinking,
-            signature: None,
-        });
+        // DSML models sometimes emit tool-call markup inside the reasoning
+        // stream. Extract it — leaving it in the Thinking block silently drops
+        // the calls (nothing downstream parses tool calls out of thinking).
+        let parsed = if dsml_model {
+            translate_dsml_tool_calls(&thinking, &format!("toolu_dsml_think_{}", response.id))
+        } else {
+            None
+        };
+        match parsed {
+            Some(parsed) => {
+                let trimmed = parsed.cleaned_text.trim();
+                if !trimmed.is_empty() {
+                    content.push(OutputContentBlock::Thinking {
+                        thinking: trimmed.to_string(),
+                        signature: None,
+                    });
+                }
+                dsml_tool_use_count += parsed.tool_uses.len();
+                for tool_use in parsed.tool_uses {
+                    content.push(OutputContentBlock::ToolUse {
+                        id: tool_use.id,
+                        name: tool_use.name,
+                        input: tool_use.input,
+                    });
+                }
+            }
+            None => content.push(OutputContentBlock::Thinking {
+                thinking,
+                signature: None,
+            }),
+        }
     }
-    let mut dsml_tool_use_count = 0usize;
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
-        let parsed = if model_emits_dsml_tool_calls(model) {
+        let parsed = if dsml_model {
             translate_dsml_tool_calls(&text, &format!("toolu_dsml_{}", response.id))
         } else {
             None
@@ -1737,7 +1874,7 @@ fn normalize_response(
                         text: trimmed.to_string(),
                     });
                 }
-                dsml_tool_use_count = parsed.tool_uses.len();
+                dsml_tool_use_count += parsed.tool_uses.len();
                 for tool_use in parsed.tool_uses {
                     content.push(OutputContentBlock::ToolUse {
                         id: tool_use.id,
@@ -1749,7 +1886,6 @@ fn normalize_response(
             None => content.push(OutputContentBlock::Text { text }),
         }
     }
-    let dsml_model = model_emits_dsml_tool_calls(model);
     for tool_call in choice.message.tool_calls {
         let mut input = parse_tool_arguments(&tool_call.function.arguments);
         if dsml_model {
@@ -2370,6 +2506,135 @@ mod tests {
     use std::borrow::Cow;
     use std::collections::BTreeMap;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn stream_state_extracts_dsml_tool_calls_from_reasoning_content() {
+        use crate::types::{ContentBlockDelta, OutputContentBlock, StreamEvent};
+        // deepseek-v4 => dsml_mode on. Regression for SWE-bench trajectories
+        // where the model emitted its DSML tool-call markup inside the
+        // reasoning stream: the calls were surfaced as thinking prose, never
+        // executed, and the agent loop ended with an empty diff.
+        let mut state = super::StreamState::new("deepseek-v4-flash".to_string());
+
+        // Markup split across two chunks, mid-token, to prove buffering.
+        let chunk1: super::ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "c1",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "delta": {"reasoning_content":
+                    "I should search the code.\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"grep_"},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+        let chunk2: super::ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "c1",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "delta": {"reasoning_content":
+                    "search\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"pattern\" string=\"true\">def foo</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>"},
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+
+        let mut events = state.ingest_chunk(chunk1).unwrap();
+        events.extend(state.ingest_chunk(chunk2).unwrap());
+        // While streaming, nothing may leak: no thinking deltas carrying markup.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ContentBlockDelta(_))),
+            "reasoning must be buffered in dsml_mode, not streamed"
+        );
+
+        events.extend(state.finish().unwrap());
+
+        // Cleaned prose survives as a Thinking block without any DSML markup.
+        let thinking_deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockDelta(d) => match &d.delta {
+                    ContentBlockDelta::ThinkingDelta { thinking } => Some(thinking.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking_deltas, vec!["I should search the code."]);
+
+        // The tool call is extracted and executable.
+        let tool_starts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockStart(s) => match &s.content_block {
+                    OutputContentBlock::ToolUse { id, name, .. } => {
+                        Some((id.clone(), name.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_starts.len(), 1);
+        assert_eq!(tool_starts[0].1, "grep_search");
+        assert!(tool_starts[0].0.starts_with("toolu_dsml_think_c1"));
+        let json_deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockDelta(d) => match &d.delta {
+                    ContentBlockDelta::InputJsonDelta { partial_json } => {
+                        Some(partial_json.as_str())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(json_deltas, vec![r#"{"pattern":"def foo"}"#]);
+
+        // finish_reason "stop" must be overridden so the agent loop dispatches.
+        let stop_reasons: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::MessageDelta(d) => d.delta.stop_reason.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stop_reasons, vec!["tool_use".to_string()]);
+    }
+
+    #[test]
+    fn normalize_response_extracts_dsml_tool_calls_from_reasoning_content() {
+        use crate::types::OutputContentBlock;
+        let response: super::ChatCompletionResponse = serde_json::from_value(json!({
+            "id": "r1",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content":
+                        "Time to look.\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"read_file\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">/testbed/x.py</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        }))
+        .unwrap();
+        let resp = normalize_response("deepseek-v4-flash", response).expect("normalize");
+
+        assert!(matches!(
+            &resp.content[0],
+            OutputContentBlock::Thinking { thinking, .. } if thinking == "Time to look."
+        ));
+        assert!(resp.content.iter().any(|b| matches!(
+            b,
+            OutputContentBlock::ToolUse { name, input, .. }
+                if name == "read_file" && input == &json!({"path": "/testbed/x.py"})
+        )));
+        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
+    }
 
     #[test]
     fn model_emits_dsml_tool_calls_detects_deepseek_v4() {

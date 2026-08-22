@@ -5254,7 +5254,37 @@ impl ApiClient for ProviderRuntimeClient {
                 ..Default::default()
             };
 
-            let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));
+            // Retry the WHOLE stream against the same provider before falling
+            // back to the next chain entry. stream_with_provider only collects
+            // events into a local Vec (nothing is surfaced mid-stream), so a
+            // retryable failure — connect refused, timeout, or a body/SSE decode
+            // error from a server under load — can safely discard the partial
+            // events and replay the identical stateless request. Without this,
+            // a single-provider chain (the eval setup) turned every first-call
+            // hiccup into a lost instance: send_with_retry only guards the
+            // response HEADERS; body reads happen while consuming the stream.
+            let attempt = (0..=STREAM_ATTEMPT_RETRIES)
+                .filter_map(|attempt| {
+                    if attempt > 0 {
+                        std::thread::sleep(stream_retry_backoff(attempt));
+                    }
+                    match runtime
+                        .block_on(stream_with_provider(&entry.client, &message_request))
+                    {
+                        Err(error) if error.is_retryable() && attempt < STREAM_ATTEMPT_RETRIES => {
+                            eprintln!(
+                                "provider {} stream attempt {}/{} failed with retryable error, retrying: {error}",
+                                entry.model,
+                                attempt + 1,
+                                STREAM_ATTEMPT_RETRIES + 1,
+                            );
+                            None
+                        }
+                        outcome => Some(outcome),
+                    }
+                })
+                .next()
+                .expect("final stream attempt always yields an outcome");
             match attempt {
                 Ok(events) => return Ok(events),
                 Err(error) if error.is_retryable() && index + 1 < chain.len() => {
@@ -5273,6 +5303,17 @@ impl ApiClient for ProviderRuntimeClient {
             |error| error.to_string(),
         )))
     }
+}
+
+/// Whole-request retries per provider entry before chain fallback. Three
+/// retries with short exponential backoff ride out server warmup bursts
+/// (the failure mode observed on SWE-bench: 10 chunks hitting a still-warming
+/// sglang server, dozens of first-call decode errors inside ~8 minutes).
+const STREAM_ATTEMPT_RETRIES: u32 = 3;
+
+fn stream_retry_backoff(attempt: u32) -> std::time::Duration {
+    // 2s, 4s, 8s — capped well below any eval timeout.
+    std::time::Duration::from_secs(2u64 << (attempt.saturating_sub(1)).min(4))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -9756,6 +9797,16 @@ mod tests {
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
         assert_eq!(background_output["noOutputExpected"], true);
+    }
+
+    #[test]
+    fn stream_retry_backoff_is_short_exponential() {
+        use std::time::Duration;
+        assert_eq!(super::stream_retry_backoff(1), Duration::from_secs(2));
+        assert_eq!(super::stream_retry_backoff(2), Duration::from_secs(4));
+        assert_eq!(super::stream_retry_backoff(3), Duration::from_secs(8));
+        // Capped: never grows past 32s even for absurd attempt numbers.
+        assert_eq!(super::stream_retry_backoff(30), Duration::from_secs(32));
     }
 
     #[test]

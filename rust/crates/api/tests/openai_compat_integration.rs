@@ -842,6 +842,56 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
+#[tokio::test]
+async fn send_message_retries_truncated_response_body() {
+    // Regression: a server under load can return 200 headers and then truncate
+    // the body (observed at SWE-bench eval start: dozens of first-call
+    // `http error: error decoding response body` failures). Body reads must sit
+    // INSIDE the retry loop — is_decode()/is_body() were already classified
+    // retryable, but the read happened after send_with_retry returned.
+    let body = concat!(
+        "{",
+        "\"id\": \"chatcmpl-ok\",",
+        "\"model\": \"grok-3\",",
+        "\"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"recovered\"}, \"finish_reason\": \"stop\"}],",
+        "\"usage\": {\"prompt_tokens\": 2, \"completion_tokens\": 3}",
+        "}"
+    );
+    // First response declares a longer body than it sends, then the connection
+    // closes -> reqwest fails the body read with a retryable decode error.
+    let truncated = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{{\"id\": \"chat",
+        body.len()
+    );
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![truncated, http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
+        .with_base_url(server.base_url())
+        .with_retry_policy(
+            2,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(50),
+        );
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("second attempt should succeed after truncated body");
+
+    assert_eq!(
+        response.content,
+        vec![OutputContentBlock::Text {
+            text: "recovered".to_string(),
+        }]
+    );
+    let captured = state.lock().await;
+    assert_eq!(captured.len(), 2, "client must have retried exactly once");
+}
+
 fn http_response(status: &str, content_type: &str, body: &str) -> String {
     http_response_with_headers(status, content_type, body, &[])
 }
