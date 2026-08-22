@@ -1698,7 +1698,7 @@ mod tests {
         .with_context_window(Some(100_000), 0.8);
         for turn in 0..5 {
             let summary = small
-                .run_turn(&format!("t{turn}"), None)
+                .run_turn(format!("t{turn}"), None)
                 .expect("turn should succeed");
             assert_eq!(
                 summary.auto_compaction, None,
