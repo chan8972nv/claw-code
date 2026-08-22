@@ -4826,6 +4826,41 @@ fn parse_solve_args(args: &[String], model: String) -> Result<CliAction, String>
     })
 }
 
+/// Nudge injected when a solve session ends cleanly with an empty diff.
+/// mini-swe-agent structurally prevents no-edit endings (every response must
+/// carry a tool call); claw's loop ends on any no-tool-call turn, which turned
+/// "model believes it is done" into guaranteed-unresolved instances (observed:
+/// sessions concluding "already fixed at HEAD" after finding the upstream fix
+/// commit in git history).
+const SOLVE_EMPTY_DIFF_NUDGE: &str = "Your session is about to end, but `git diff` is EMPTY — \
+you have not modified any source files, so there is no fix to submit and the task will be \
+graded as failed. The task REQUIRES a code change. Note that your checkout predates any \
+upstream fix: a fix commit existing in git history does NOT mean it is applied at HEAD — \
+never conclude \"already fixed\". Locate the root cause, apply the fix to the working tree \
+now, and verify it with the project's tests.";
+
+/// True when the working tree contains changes that would land in the
+/// extracted patch. Uses the same pathspec as extraction (stage first so
+/// untracked files count, excludes so claw artifacts and env files don't).
+/// Errs on the side of `true` (no nudge) when git state cannot be read.
+fn solve_working_tree_has_changes() -> bool {
+    let pathspec = solve_patch_pathspec();
+    let pathspec: Vec<&str> = pathspec.iter().map(String::as_str).collect();
+    let staged = std::process::Command::new("git")
+        .args(["add", "-A", "--"])
+        .args(&pathspec)
+        .output();
+    if staged.is_err() {
+        return true;
+    }
+    std::process::Command::new("git")
+        .args(["diff", "--cached", "--quiet", "--"])
+        .args(&pathspec)
+        .status()
+        // `--quiet` exits 1 when differences exist.
+        .map_or(true, |status| !status.success())
+}
+
 /// Pathspec for solve-mode patch extraction: include everything, minus claw's
 /// runtime artifacts and dependency/build caches (see comment at the call
 /// site), plus any caller-specified globs from `CLAW_PATCH_EXCLUDE_GLOBS`
@@ -4970,6 +5005,20 @@ fn solve_problem(
         }
         Err(error) => {
             eprintln!("[solve] Error: {error}");
+        }
+    }
+
+    // No-edit termination guard: one continuation nudge when the session ended
+    // cleanly without touching a single source file. Only on Ok — after an API
+    // error or exhausted iteration budget another full turn would not help.
+    if result.is_ok() && !solve_working_tree_has_changes() {
+        eprintln!("[solve] Completed with an empty diff — sending one continuation nudge...");
+        match runtime.run_turn(SOLVE_EMPTY_DIFF_NUDGE, Some(&mut permission_prompter)) {
+            Ok(turn) => eprintln!(
+                "[solve] Nudge turn completed in {} iterations (input={} output={})",
+                turn.iterations, turn.usage.input_tokens, turn.usage.output_tokens
+            ),
+            Err(error) => eprintln!("[solve] Nudge turn error: {error}"),
         }
     }
 
@@ -14919,6 +14968,46 @@ mod tests {
             None,
         )])
         .expect("plugin tool registry should build")
+    }
+
+    #[test]
+    fn solve_working_tree_has_changes_respects_exclude_globs() {
+        let _lock = env_lock();
+        let dir = std::env::temp_dir().join(format!("claw-nudge-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create repo dir");
+        let original = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&dir).expect("enter repo");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .output()
+                .expect("git runs")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write("src.py", "x = 1\n").expect("write");
+        std::fs::write("setup.py", "install_requires = []\n").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+
+        // Clean tree: no changes.
+        std::env::remove_var("CLAW_PATCH_EXCLUDE_GLOBS");
+        assert!(!super::solve_working_tree_has_changes());
+
+        // Env-file-only edit is invisible when the glob excludes it...
+        std::fs::write("setup.py", "install_requires = ['pinned<1']\n").expect("write");
+        std::env::set_var("CLAW_PATCH_EXCLUDE_GLOBS", "setup.py");
+        assert!(!super::solve_working_tree_has_changes());
+
+        // ...but a source edit counts.
+        std::fs::write("src.py", "x = 2\n").expect("write");
+        assert!(super::solve_working_tree_has_changes());
+
+        std::env::remove_var("CLAW_PATCH_EXCLUDE_GLOBS");
+        std::env::set_current_dir(original).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
