@@ -17,6 +17,15 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 250_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+/// Context-window-relative auto-compaction (preferred when set): compact when
+/// the LATEST request's prompt size reaches `fraction * window`. The legacy
+/// CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS trigger compares the CUMULATIVE input
+/// tokens across all iterations — a spend meter, not a context meter: a
+/// 100-iteration session with a steady 25k-token context "accumulates" 2.5M
+/// and compacts repeatedly while the real context is nowhere near full.
+const CONTEXT_WINDOW_ENV_VAR: &str = "CLAW_CONTEXT_WINDOW_TOKENS";
+const AUTO_COMPACT_FRACTION_ENV_VAR: &str = "CLAW_AUTO_COMPACT_FRACTION";
+const DEFAULT_AUTO_COMPACT_FRACTION: f64 = 0.8;
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +150,11 @@ pub struct ConversationRuntime<C, T> {
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
+    /// When Some, overrides the cumulative threshold: compact when the latest
+    /// request's prompt (input + cache-read tokens) reaches
+    /// `auto_compact_fraction * context_window_tokens`.
+    context_window_tokens: Option<u32>,
+    auto_compact_fraction: f64,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
@@ -190,6 +204,8 @@ where
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
+            context_window_tokens: context_window_from_env(),
+            auto_compact_fraction: auto_compact_fraction_from_env(),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
@@ -213,6 +229,17 @@ where
     /// server-returned context window size from a 400 error).
     pub fn set_auto_compaction_input_tokens_threshold(&mut self, threshold: u32) {
         self.auto_compaction_input_tokens_threshold = threshold;
+    }
+
+    /// Enable the window-relative trigger (see CONTEXT_WINDOW_ENV_VAR docs).
+    /// A `fraction` outside (0, 1] keeps the current fraction.
+    #[must_use]
+    pub fn with_context_window(mut self, window: Option<u32>, fraction: f64) -> Self {
+        self.context_window_tokens = window;
+        if fraction > 0.0 && fraction <= 1.0 {
+            self.auto_compact_fraction = fraction;
+        }
+        self
     }
 
     #[must_use]
@@ -579,9 +606,22 @@ where
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
-            < self.auto_compaction_input_tokens_threshold
-        {
+        let should_compact = if let Some(window) = self.context_window_tokens {
+            // Variable trigger: the latest request's prompt size is the true
+            // context occupancy (cache-read tokens are part of the prompt on
+            // providers that report them separately).
+            let latest = self.usage_tracker.current_turn_usage();
+            let occupancy = latest
+                .input_tokens
+                .saturating_add(latest.cache_read_input_tokens);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let limit = (f64::from(window) * self.auto_compact_fraction) as u32;
+            occupancy >= limit.max(1)
+        } else {
+            self.usage_tracker.cumulative_usage().input_tokens
+                >= self.auto_compaction_input_tokens_threshold
+        };
+        if !should_compact {
             return None;
         }
 
@@ -719,6 +759,27 @@ pub fn auto_compaction_threshold_from_env() -> u32 {
             .ok()
             .as_deref(),
     )
+}
+
+/// Model context window from CLAW_CONTEXT_WINDOW_TOKENS; None disables the
+/// window-relative trigger (legacy cumulative behavior).
+#[must_use]
+pub fn context_window_from_env() -> Option<u32> {
+    std::env::var(CONTEXT_WINDOW_ENV_VAR)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|window| *window > 0)
+}
+
+/// Compaction fraction from CLAW_AUTO_COMPACT_FRACTION, clamped to (0, 1];
+/// defaults to 0.8.
+#[must_use]
+pub fn auto_compact_fraction_from_env() -> f64 {
+    std::env::var(AUTO_COMPACT_FRACTION_ENV_VAR)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|fraction| *fraction > 0.0 && *fraction <= 1.0)
+        .unwrap_or(DEFAULT_AUTO_COMPACT_FRACTION)
 }
 
 #[must_use]
@@ -1584,6 +1645,82 @@ mod tests {
     #[cfg(not(windows))]
     fn shell_snippet(script: &str) -> String {
         script.to_string()
+    }
+
+    #[test]
+    fn window_relative_trigger_uses_latest_prompt_not_cumulative() {
+        // With a context window set, compaction keys off the LATEST request's
+        // prompt size, not the cumulative spend. Two identically-shaped
+        // runtimes; only per-turn prompt size differs.
+        struct FixedPromptApi(u32);
+        impl ApiClient for FixedPromptApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: self.0,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+        fn seeded_session() -> Session {
+            let mut session = Session::new();
+            session.messages = vec![
+                crate::session::ConversationMessage::user_text("one"),
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "two".to_string(),
+                }]),
+                crate::session::ConversationMessage::user_text("three"),
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "four".to_string(),
+                }]),
+            ];
+            session
+        }
+
+        // Small steady prompts: cumulative crosses any fixed threshold after a
+        // few turns, but occupancy stays at 10k of a 100k window -> no compact.
+        let mut small = ConversationRuntime::new(
+            seeded_session(),
+            FixedPromptApi(10_000),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(15_000)
+        .with_context_window(Some(100_000), 0.8);
+        for turn in 0..5 {
+            let summary = small
+                .run_turn(&format!("t{turn}"), None)
+                .expect("turn should succeed");
+            assert_eq!(
+                summary.auto_compaction, None,
+                "steady 10k context must never compact (turn {turn})"
+            );
+        }
+
+        // One large prompt at 85% occupancy compacts immediately.
+        let mut large = ConversationRuntime::new(
+            seeded_session(),
+            FixedPromptApi(85_000),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(u32::MAX)
+        .with_context_window(Some(100_000), 0.8);
+        let summary = large.run_turn("big", None).expect("turn should succeed");
+        assert!(
+            summary.auto_compaction.is_some(),
+            "85% of the window must compact even though cumulative is tiny"
+        );
     }
 
     #[test]
