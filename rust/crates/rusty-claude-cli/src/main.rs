@@ -4826,6 +4826,79 @@ fn parse_solve_args(args: &[String], model: String) -> Result<CliAction, String>
     })
 }
 
+/// Pathspec for solve-mode patch extraction: include everything, minus claw's
+/// runtime artifacts and dependency/build caches (see comment at the call
+/// site), plus any caller-specified globs from `CLAW_PATCH_EXCLUDE_GLOBS`
+/// (colon-separated). Eval harnesses use the env var to keep environment
+/// repair out of the submitted patch — e.g. `setup.py:pyproject.toml` stops
+/// dependency pins (made while fighting a broken test env) from shipping as
+/// the "fix". Globs are excludes only; the `:(exclude)` prefix is added here.
+fn solve_patch_pathspec() -> Vec<String> {
+    let mut pathspec: Vec<String> = [
+        ".",
+        ":(exclude).claw",
+        ":(exclude).clawd-todos.json",
+        ":(exclude).sandbox-home",
+        ":(exclude).sandbox-tmp",
+        ":(exclude)CLAUDE.md",
+        ":(exclude)node_modules",
+        ":(exclude)**/node_modules/**",
+        ":(exclude)__pycache__",
+        ":(exclude)**/__pycache__/**",
+        ":(exclude).venv",
+        ":(exclude)**/.venv/**",
+        ":(exclude)venv",
+        ":(exclude)**/venv/**",
+        ":(exclude).tox",
+        ":(exclude)**/.tox/**",
+        ":(exclude)*.egg-info",
+        ":(exclude)**/*.egg-info/**",
+        ":(exclude).pytest_cache",
+        ":(exclude)**/.pytest_cache/**",
+        ":(exclude).mypy_cache",
+        ":(exclude)**/.mypy_cache/**",
+        // Package-manager caches: matter when claw runs WITHOUT a sandbox home
+        // so a tool writes its cache to $HOME == repo root (e.g. `stack` dumped
+        // the Hackage index into .stack for a 1.4 GB patch). Never part of a fix.
+        ":(exclude).stack",
+        ":(exclude)**/.stack/**",
+        ":(exclude).cargo",
+        ":(exclude)**/.cargo/**",
+        ":(exclude).m2",
+        ":(exclude)**/.m2/**",
+        ":(exclude).npm",
+        ":(exclude)**/.npm/**",
+        ":(exclude).gradle",
+        ":(exclude)**/.gradle/**",
+        ":(exclude).bundle",
+        ":(exclude)**/.bundle/**",
+        ":(exclude).cache",
+        ":(exclude)**/.cache/**",
+        ":(exclude).ccache",
+        ":(exclude)**/.ccache/**",
+        ":(exclude).gem",
+        ":(exclude)**/.gem/**",
+        ":(exclude).nuget",
+        ":(exclude)**/.nuget/**",
+        ":(exclude).cabal",
+        ":(exclude)**/.cabal/**",
+        ":(exclude).ivy2",
+        ":(exclude)**/.ivy2/**",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    if let Ok(raw) = std::env::var("CLAW_PATCH_EXCLUDE_GLOBS") {
+        for glob in raw.split(':') {
+            let glob = glob.trim();
+            if !glob.is_empty() {
+                pathspec.push(format!(":(exclude){glob}"));
+            }
+        }
+    }
+    pathspec
+}
+
 fn solve_problem(
     problem_file: Option<PathBuf>,
     problem: &str,
@@ -4962,60 +5035,11 @@ fn solve_problem(
     // prefix match), while `**/<name>/**` excludes the contents when the dir is
     // NESTED (git's leading `**/` requires >=1 path segment, so it misses the
     // top-level case). Verified against git 2.34.
-    let pathspec = [
-        ".",
-        ":(exclude).claw",
-        ":(exclude).clawd-todos.json",
-        ":(exclude).sandbox-home",
-        ":(exclude).sandbox-tmp",
-        ":(exclude)CLAUDE.md",
-        ":(exclude)node_modules",
-        ":(exclude)**/node_modules/**",
-        ":(exclude)__pycache__",
-        ":(exclude)**/__pycache__/**",
-        ":(exclude).venv",
-        ":(exclude)**/.venv/**",
-        ":(exclude)venv",
-        ":(exclude)**/venv/**",
-        ":(exclude).tox",
-        ":(exclude)**/.tox/**",
-        ":(exclude)*.egg-info",
-        ":(exclude)**/*.egg-info/**",
-        ":(exclude).pytest_cache",
-        ":(exclude)**/.pytest_cache/**",
-        ":(exclude).mypy_cache",
-        ":(exclude)**/.mypy_cache/**",
-        // Package-manager caches: matter when claw runs WITHOUT a sandbox home
-        // so a tool writes its cache to $HOME == repo root (e.g. `stack` dumped
-        // the Hackage index into .stack for a 1.4 GB patch). Never part of a fix.
-        ":(exclude).stack",
-        ":(exclude)**/.stack/**",
-        ":(exclude).cargo",
-        ":(exclude)**/.cargo/**",
-        ":(exclude).m2",
-        ":(exclude)**/.m2/**",
-        ":(exclude).npm",
-        ":(exclude)**/.npm/**",
-        ":(exclude).gradle",
-        ":(exclude)**/.gradle/**",
-        ":(exclude).bundle",
-        ":(exclude)**/.bundle/**",
-        ":(exclude).cache",
-        ":(exclude)**/.cache/**",
-        ":(exclude).ccache",
-        ":(exclude)**/.ccache/**",
-        ":(exclude).gem",
-        ":(exclude)**/.gem/**",
-        ":(exclude).nuget",
-        ":(exclude)**/.nuget/**",
-        ":(exclude).cabal",
-        ":(exclude)**/.cabal/**",
-        ":(exclude).ivy2",
-        ":(exclude)**/.ivy2/**",
-    ];
+    let pathspec = solve_patch_pathspec();
+    let pathspec: Vec<&str> = pathspec.iter().map(String::as_str).collect();
     let stage_result = std::process::Command::new("git")
         .args(["add", "-A", "--"])
-        .args(pathspec)
+        .args(&pathspec)
         .output();
     if let Ok(output) = &stage_result {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5028,7 +5052,7 @@ fn solve_problem(
 
     let patch_output = std::process::Command::new("git")
         .args(["diff", "--cached", "--binary", "--"])
-        .args(pathspec)
+        .args(&pathspec)
         .output();
 
     let patch = match patch_output {
@@ -14895,6 +14919,29 @@ mod tests {
             None,
         )])
         .expect("plugin tool registry should build")
+    }
+
+    #[test]
+    fn solve_patch_pathspec_appends_env_excludes() {
+        let _lock = env_lock();
+        // Without the env var: statics only, starting with the include-all dot.
+        std::env::remove_var("CLAW_PATCH_EXCLUDE_GLOBS");
+        let base = super::solve_patch_pathspec();
+        assert_eq!(base[0], ".");
+        assert!(base.iter().any(|p| p == ":(exclude).claw"));
+        assert!(!base.iter().any(|p| p.contains("setup.py")));
+
+        // With it: each colon-separated glob becomes an :(exclude) entry.
+        std::env::set_var(
+            "CLAW_PATCH_EXCLUDE_GLOBS",
+            "setup.py: pyproject.toml :requirements*.txt::",
+        );
+        let extended = super::solve_patch_pathspec();
+        std::env::remove_var("CLAW_PATCH_EXCLUDE_GLOBS");
+        assert_eq!(extended.len(), base.len() + 3, "empty segments are skipped");
+        assert!(extended.iter().any(|p| p == ":(exclude)setup.py"));
+        assert!(extended.iter().any(|p| p == ":(exclude)pyproject.toml"));
+        assert!(extended.iter().any(|p| p == ":(exclude)requirements*.txt"));
     }
 
     #[test]
