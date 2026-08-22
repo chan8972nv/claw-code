@@ -38,19 +38,34 @@ fn is_binary_file(path: &Path) -> io::Result<bool> {
 /// Validate that a resolved path stays within the given workspace root.
 /// Returns the canonical path on success, or an error if the path escapes
 /// the workspace boundary (e.g. via `../` traversal or symlink).
+///
+/// `CLAW_FILE_TOOL_EXTRA_ROOTS` (colon-separated absolute paths) whitelists
+/// additional roots. Motivation: eval harnesses instruct the agent to keep
+/// reproducers under `/tmp` so scratch files never enter the patch — but the
+/// boundary check rejected exactly those writes (`escapes workspace`), hit in
+/// ~11% of SWE-bench sessions before the model fell back to bash heredocs.
+/// Opt-in via env, so interactive claw keeps the strict default.
 #[allow(dead_code)]
 fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Result<()> {
-    if !resolved.starts_with(workspace_root) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "path {} escapes workspace boundary {}",
-                resolved.display(),
-                workspace_root.display()
-            ),
-        ));
+    if resolved.starts_with(workspace_root) {
+        return Ok(());
     }
-    Ok(())
+    if let Ok(raw) = std::env::var("CLAW_FILE_TOOL_EXTRA_ROOTS") {
+        for root in raw.split(':') {
+            let root = root.trim();
+            if !root.is_empty() && Path::new(root).is_absolute() && resolved.starts_with(root) {
+                return Ok(());
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "path {} escapes workspace boundary {}",
+            resolved.display(),
+            workspace_root.display()
+        ),
+    ))
 }
 
 /// Text payload returned by file-reading operations.
@@ -1034,6 +1049,40 @@ mod tests {
             .expect("time should move forward")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-native-{name}-{unique}"))
+    }
+
+    #[test]
+    fn extra_roots_env_whitelists_paths_outside_workspace() {
+        // Serialize env mutation across parallel tests in this binary.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        use super::validate_workspace_boundary;
+        use std::path::Path;
+        std::env::remove_var("CLAW_FILE_TOOL_EXTRA_ROOTS");
+        let workspace = Path::new("/repo");
+        assert!(validate_workspace_boundary(Path::new("/repo/src/a.py"), workspace).is_ok());
+        assert!(validate_workspace_boundary(Path::new("/tmp/repro.py"), workspace).is_err());
+
+        std::env::set_var("CLAW_FILE_TOOL_EXTRA_ROOTS", "/tmp: relative :/scratch");
+        assert!(
+            validate_workspace_boundary(Path::new("/tmp/repro.py"), workspace).is_ok(),
+            "whitelisted root is allowed"
+        );
+        assert!(
+            validate_workspace_boundary(Path::new("/scratch/x"), workspace).is_ok(),
+            "multiple roots supported"
+        );
+        assert!(
+            validate_workspace_boundary(Path::new("/etc/passwd"), workspace).is_err(),
+            "non-whitelisted paths still rejected"
+        );
+        assert!(
+            validate_workspace_boundary(Path::new("/tmpfoo/x"), workspace).is_err(),
+            "prefix must match a path component, not a string prefix"
+        );
+        std::env::remove_var("CLAW_FILE_TOOL_EXTRA_ROOTS");
     }
 
     #[test]
