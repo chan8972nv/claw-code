@@ -754,12 +754,6 @@ fn get_simple_doing_tasks_section() -> String {
         "Report outcomes faithfully: if verification failed or was not run, say so explicitly.".to_string(),
     ]);
 
-    // Include tool descriptions and usage guidance only when CLAW_INCLUDE_TOOL_GUIDANCE=1
-    // is set. This allows ablation studies to measure the impact of tool guidance
-    // independently of other prompt changes.
-    let _include_tool_guidance = std::env::var("CLAW_INCLUDE_TOOL_GUIDANCE")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-
     let mut sections: Vec<String> = vec!["# Doing tasks".to_string()];
     sections.extend(items);
     sections.join("\n")
