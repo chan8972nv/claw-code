@@ -4880,6 +4880,24 @@ upstream fix: a fix commit existing in git history does NOT mean it is applied a
 never conclude \"already fixed\". Locate the root cause, apply the fix to the working tree \
 now, and verify it with the project's tests.";
 
+/// How many times to re-prompt a solve session that ended with an empty diff.
+///
+/// One nudge is not enough. Over the uuu8 claw run (7,627 sessions) the nudge
+/// fired on 736 and recovered 444 of them (60.3%) — the other 292 ended empty
+/// anyway and were guaranteed-unresolved. Recovery is roughly memoryless, so a
+/// second and third attempt should convert most of that remainder. Bounded so a
+/// model that has genuinely given up cannot spin: each nudge is a full turn.
+///
+/// Override with `CLAW_EMPTY_DIFF_NUDGES` (0 disables the guard entirely).
+const SOLVE_EMPTY_DIFF_NUDGE_DEFAULT: usize = 3;
+
+fn solve_empty_diff_nudge_budget() -> usize {
+    std::env::var("CLAW_EMPTY_DIFF_NUDGES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(SOLVE_EMPTY_DIFF_NUDGE_DEFAULT)
+}
+
 /// True when the working tree contains changes that would land in the
 /// extracted patch. Uses the same pathspec as extraction (stage first so
 /// untracked files count, excludes so claw artifacts and env files don't).
@@ -5049,17 +5067,32 @@ fn solve_problem(
         }
     }
 
-    // No-edit termination guard: one continuation nudge when the session ended
-    // cleanly without touching a single source file. Only on Ok — after an API
-    // error or exhausted iteration budget another full turn would not help.
-    if result.is_ok() && !solve_working_tree_has_changes() {
-        eprintln!("[solve] Completed with an empty diff — sending one continuation nudge...");
-        match runtime.run_turn(SOLVE_EMPTY_DIFF_NUDGE, Some(&mut permission_prompter)) {
-            Ok(turn) => eprintln!(
-                "[solve] Nudge turn completed in {} iterations (input={} output={})",
-                turn.iterations, turn.usage.input_tokens, turn.usage.output_tokens
-            ),
-            Err(error) => eprintln!("[solve] Nudge turn error: {error}"),
+    // No-edit termination guard: re-prompt when the session ended cleanly
+    // without touching a single source file. Only on Ok — after an API error or
+    // exhausted iteration budget another full turn would not help. Retried up to
+    // `solve_empty_diff_nudge_budget()` times because a single nudge leaves ~40%
+    // of no-edit sessions still empty (see SOLVE_EMPTY_DIFF_NUDGE_DEFAULT).
+    if result.is_ok() {
+        let budget = solve_empty_diff_nudge_budget();
+        for attempt in 1..=budget {
+            if solve_working_tree_has_changes() {
+                break;
+            }
+            eprintln!(
+                "[solve] Completed with an empty diff — sending continuation nudge {attempt}/{budget}..."
+            );
+            match runtime.run_turn(SOLVE_EMPTY_DIFF_NUDGE, Some(&mut permission_prompter)) {
+                Ok(turn) => eprintln!(
+                    "[solve] Nudge turn {attempt} completed in {} iterations (input={} output={})",
+                    turn.iterations, turn.usage.input_tokens, turn.usage.output_tokens
+                ),
+                // An API/transport failure will not fix itself on the next turn,
+                // and each retry costs a full context replay — stop here.
+                Err(error) => {
+                    eprintln!("[solve] Nudge turn {attempt} error: {error}");
+                    break;
+                }
+            }
         }
     }
 
@@ -15084,6 +15117,29 @@ mod tests {
         std::env::set_var("CLAW_SOLVE_ALLOWED_TOOLS", "all");
         assert!(super::solve_allowed_tools().is_none(), "all = old behavior");
         std::env::remove_var("CLAW_SOLVE_ALLOWED_TOOLS");
+    }
+
+    #[test]
+    fn solve_empty_diff_nudge_budget_reads_env() {
+        let _lock = env_lock();
+        std::env::remove_var("CLAW_EMPTY_DIFF_NUDGES");
+        assert_eq!(
+            super::solve_empty_diff_nudge_budget(),
+            super::SOLVE_EMPTY_DIFF_NUDGE_DEFAULT
+        );
+
+        std::env::set_var("CLAW_EMPTY_DIFF_NUDGES", " 5 ");
+        assert_eq!(super::solve_empty_diff_nudge_budget(), 5);
+
+        // 0 disables the guard; garbage falls back to the default.
+        std::env::set_var("CLAW_EMPTY_DIFF_NUDGES", "0");
+        assert_eq!(super::solve_empty_diff_nudge_budget(), 0);
+        std::env::set_var("CLAW_EMPTY_DIFF_NUDGES", "not-a-number");
+        assert_eq!(
+            super::solve_empty_diff_nudge_budget(),
+            super::SOLVE_EMPTY_DIFF_NUDGE_DEFAULT
+        );
+        std::env::remove_var("CLAW_EMPTY_DIFF_NUDGES");
     }
 
     #[test]
