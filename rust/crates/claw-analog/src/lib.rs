@@ -868,29 +868,76 @@ fn run_git_capped(workspace: &Path, args: &[String], cap: usize) -> Result<Strin
     }
 }
 
-/// Tools the analog implements itself (workspace-relative paths, own caps).
-/// A shared spec with one of these names is skipped so the analog semantics win.
-const NATIVE_TOOL_NAMES: [&str; 9] = [
-    "read_file",
-    "list_dir",
-    "glob_workspace",
-    "grep_workspace",
+/// Tool names the `tools` crate exposes on the `main` branch (its
+/// `mvp_tool_specs`). The analog advertises the intersection of this list with
+/// what this branch actually implements, so the model sees the same tool
+/// surface it would on `main`: branch-only tools (the `Git*` family) stay out,
+/// and the five `main` tools this branch deleted — `LSP`, `PowerShell`,
+/// `SendUserMessage`, `Sleep`, `TaskOutput` — are simply absent rather than
+/// advertised and unrunnable. Refresh with:
+/// `git show main:rust/crates/tools/src/lib.rs | grep -oP 'name: "\K[A-Za-z_]+(?=")'`
+const MAIN_BRANCH_TOOL_NAMES: [&str; 50] = [
+    "Agent",
+    "AskUserQuestion",
+    "bash",
+    "Config",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "edit_file",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "glob_search",
     "grep_search",
-    "git_diff",
-    "git_log",
-    "retrieve_context",
+    "ListMcpResources",
+    "LSP",
+    "MCP",
+    "McpAuth",
+    "NotebookEdit",
+    "PowerShell",
+    "read_file",
+    "ReadMcpResource",
+    "RemoteTrigger",
+    "REPL",
+    "RunTaskPacket",
+    "SendUserMessage",
+    "Skill",
+    "Sleep",
+    "StructuredOutput",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TaskUpdate",
+    "TeamCreate",
+    "TeamDelete",
+    "TestingPermission",
+    "TodoWrite",
+    "ToolSearch",
+    "WebFetch",
+    "WebSearch",
+    "WorkerAwaitReady",
+    "WorkerCreate",
+    "WorkerGet",
+    "WorkerObserve",
+    "WorkerObserveCompletion",
+    "WorkerResolveTrust",
+    "WorkerRestart",
+    "WorkerSendPrompt",
+    "WorkerTerminate",
     "write_file",
 ];
 
-/// Every built-in of the shared `tools` crate that the analog does not
-/// implement natively — `bash`, `edit_file`, `glob_search`, the web/task/worker/
-/// git/MCP families, and so on. `ToolSearch` is dropped: the analog advertises
-/// every spec up front, so there is nothing deferred to search for.
+/// Built-ins of the shared `tools` crate that this branch implements and
+/// `main` also exposes. `retrieve_context` is the one tool outside this set,
+/// and only when RAG is configured — it is a separate opt-in service, not part
+/// of the built-in surface.
 fn shared_tool_specs() -> Vec<ToolSpec> {
     let web_disabled = tools::web_tools_disabled();
     mvp_tool_specs()
         .into_iter()
-        .filter(|spec| spec.name != "ToolSearch" && !NATIVE_TOOL_NAMES.contains(&spec.name))
+        .filter(|spec| MAIN_BRANCH_TOOL_NAMES.contains(&spec.name))
         .filter(|spec| !(web_disabled && tools::WEB_TOOL_NAMES.contains(&spec.name)))
         .collect()
 }
@@ -921,120 +968,23 @@ fn build_policy(mode: PermissionMode) -> PermissionPolicy {
         .fold(policy, |policy, spec| {
             policy.with_tool_requirement(spec.name, spec.required_permission)
         });
-    policy
-        .with_tool_requirement("read_file", PermissionMode::ReadOnly)
-        .with_tool_requirement("list_dir", PermissionMode::ReadOnly)
-        .with_tool_requirement("glob_workspace", PermissionMode::ReadOnly)
-        .with_tool_requirement("grep_workspace", PermissionMode::ReadOnly)
-        .with_tool_requirement("grep_search", PermissionMode::ReadOnly)
-        .with_tool_requirement("git_diff", PermissionMode::ReadOnly)
-        .with_tool_requirement("git_log", PermissionMode::ReadOnly)
-        .with_tool_requirement("retrieve_context", PermissionMode::ReadOnly)
-        .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite)
+    policy.with_tool_requirement("retrieve_context", PermissionMode::ReadOnly)
 }
 
-fn tool_definitions(mode: PermissionMode, rag_base_url: Option<&str>) -> Vec<ToolDefinition> {
-    let mut tools = vec![
-        ToolDefinition {
-            name: "read_file".to_string(),
-            description: Some("Read a UTF-8 file under the workspace.".to_string()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Relative path from workspace root" }
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolDefinition {
-            name: "list_dir".to_string(),
-            description: Some("Non-recursive directory listing (use `.` for root).".to_string()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Relative directory" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "glob_workspace".to_string(),
-            description: Some(
-                "List UTF-8 file paths under workspace matching a glob (relative to search root). Recursive depth and path count are capped. For Rust monorepos, crates often live under `rust/crates/<name>/`; use `root` `.` and patterns like `**/my-crate/**/*.rs` if a direct path is unknown.".to_string(),
-            ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "root": { "type": "string", "description": "Relative directory under workspace (default `.`)" },
-                    "pattern": { "type": "string", "description": "Glob relative to root, use `/` e.g. `**/*.rs`" },
-                    "max_paths": { "type": "integer", "description": "Max paths to return (capped by server)" }
-                },
-                "required": ["pattern"]
-            }),
-        },
-        ToolDefinition {
-            name: "grep_workspace".to_string(),
-            description: Some(
-                "Literal substring search per line (no regex, no shell). Pass `path`, or `paths`, or `glob` + optional `glob_root`.".to_string(),
-            ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Single relative file" },
-                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Several relative files" },
-                    "glob": { "type": "string", "description": "Glob of files under workspace (same rules as glob_workspace)" },
-                    "glob_root": { "type": "string", "description": "Directory for `glob` (default `.`)" },
-                    "pattern": { "type": "string", "description": "Literal substring" },
-                    "max_lines": { "type": "integer", "description": "Total max matching lines across all files (capped)" }
-                },
-                "required": ["pattern"]
-            }),
-        },
-        ToolDefinition {
-            name: "grep_search".to_string(),
-            description: Some("Alias of `grep_workspace` (prompt compatibility). Same inputs.".to_string()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "paths": { "type": "array", "items": { "type": "string" } },
-                    "glob": { "type": "string" },
-                    "glob_root": { "type": "string" },
-                    "pattern": { "type": "string" },
-                    "max_lines": { "type": "integer" }
-                },
-                "required": ["pattern"]
-            }),
-        },
-        ToolDefinition {
-            name: "git_diff".to_string(),
-            description: Some(
-                "Read-only `git diff` from the workspace repo (no color). Optional `cached` for staged diff; optional `rev_range`; optional path filters.".to_string(),
-            ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "cached": { "type": "boolean", "description": "Use --cached (staged diff)" },
-                    "rev_range": { "type": "string", "description": "Revision range like `HEAD~3..HEAD` or `main...HEAD`" },
-                    "context_lines": { "type": "integer", "description": "Unified diff context lines (passed as -U<n>)" },
-                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Relative paths to limit the diff" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "git_log".to_string(),
-            description: Some(
-                "Read-only `git log` from the workspace repo (no color). Supports `max_count`, optional `rev_range`, optional path filters.".to_string(),
-            ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "max_count": { "type": "integer", "description": "Max commits (default 20; capped by server)" },
-                    "rev_range": { "type": "string", "description": "Revision range like `HEAD~20..HEAD`" },
-                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Relative paths to limit the log" }
-                }
-            }),
-        },
-    ];
+/// The advertised tool surface: every shared built-in from
+/// [`shared_tool_specs`], plus `retrieve_context` when RAG is configured.
+///
+/// Tools are listed in every permission mode, exactly as the main CLI does;
+/// execution is gated per call (see [`dispatch_tool`]).
+fn tool_definitions(rag_base_url: Option<&str>) -> Vec<ToolDefinition> {
+    let mut tools: Vec<ToolDefinition> = shared_tool_specs()
+        .into_iter()
+        .map(|spec| ToolDefinition {
+            name: spec.name.to_string(),
+            description: Some(spec.description.to_string()),
+            input_schema: spec.input_schema,
+        })
+        .collect();
     if rag_base_url.is_some() {
         tools.push(ToolDefinition {
             name: "retrieve_context".to_string(),
@@ -1051,41 +1001,15 @@ fn tool_definitions(mode: PermissionMode, rag_base_url: Option<&str>) -> Vec<Too
             }),
         });
     }
-    if matches!(
-        mode,
-        PermissionMode::WorkspaceWrite | PermissionMode::DangerFullAccess | PermissionMode::Allow
-    ) {
-        tools.push(ToolDefinition {
-            name: "write_file".to_string(),
-            description: Some(
-                "Create or overwrite a UTF-8 file (parents created if needed).".to_string(),
-            ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" }
-                },
-                "required": ["path", "content"]
-            }),
-        });
-    }
-    // Shared built-ins are advertised in every mode, exactly as the main CLI
-    // does; execution is gated per call (see `dispatch_tool`).
-    tools.extend(shared_tool_specs().into_iter().map(|spec| ToolDefinition {
-        name: spec.name.to_string(),
-        description: Some(spec.description.to_string()),
-        input_schema: spec.input_schema,
-    }));
     tools
 }
 
-/// Explains the shared `tools` built-ins that sit alongside the analog's own
-/// workspace tools (`bash`, `edit_file`, web, task/worker, git, MCP, …).
-const SHARED_TOOLS_HINT: &str = "Alongside the workspace tools above you also have the shared claw built-ins (`bash`, `edit_file`, `glob_search`, `TodoWrite`, `WebFetch`/`WebSearch`, the Git*/Task*/Worker*/MCP families, and more). They are listed in every permission mode but gated per call, so one may still be denied under the active mode. Their paths resolve against the process working directory, which is the workspace root; the workspace-relative tools above stay the cheapest way to read and search this repo.";
+/// Describes the tool surface: the shared `tools` built-ins, same set the
+/// main CLI offers.
+const SHARED_TOOLS_HINT: &str = "Every tool is a shared claw built-in (`bash`, `read_file`, `write_file`, `edit_file`, `glob_search`, `grep_search`, `TodoWrite`, `WebFetch`/`WebSearch`, the Task*/Worker*/MCP families, and more). They are listed in every permission mode but gated per call, so one may still be denied under the active mode. Paths resolve against the process working directory, which is the workspace root; a tool call is refused outright if that is not the case.";
 
 /// Nudge models away from answering “implementation” questions from ops wiring alone.
-const SOURCE_GROUNDING_HINT: &str = "When asked where something is implemented or how an internal pipeline works, ground the answer in program source (e.g. crate modules, `main`/CLI entrypoints), not only deployment manifests (`docker-compose`, CI YAML, shell scripts) unless the question is explicitly about ops. Open the relevant service sources before concluding. If `list_dir`/`glob_workspace` under a short name (e.g. a service folder) returns empty, this repo is often a monorepo: try `glob_workspace` with `root` `.` and a broad `pattern` such as `**/claw-rag-service/**/*.rs` or `rust/crates/**/src/**/*.rs` before concluding the code is missing.";
+const SOURCE_GROUNDING_HINT: &str = "When asked where something is implemented or how an internal pipeline works, ground the answer in program source (e.g. crate modules, `main`/CLI entrypoints), not only deployment manifests (`docker-compose`, CI YAML, shell scripts) unless the question is explicitly about ops. Open the relevant service sources before concluding. If a search under a short name (e.g. a service folder) returns nothing, this repo is often a monorepo: retry `glob_search` with a broad pattern such as `**/claw-rag-service/**/*.rs` or `rust/crates/**/src/**/*.rs` before concluding the code is missing.";
 
 fn system_prompt(
     mode: PermissionMode,
@@ -1101,23 +1025,22 @@ fn system_prompt(
     } else {
         ""
     };
-    let git_blurb = ", `git_diff`, `git_log` (read-only git context)";
     let base = match mode {
         PermissionMode::ReadOnly => format!(
-            "You are a read-only coding assistant. Workspace root: {root_s}. \
-             Tools: `read_file`, `list_dir`, `glob_workspace`, `grep_workspace` / `grep_search` (literal substring){git_blurb}{rag_blurb}. Paths relative; use `/`; no `..`."
+            "You are a read-only coding assistant. Workspace root: {root_s}{rag_blurb}. \
+             Reading and searching are allowed; writes, edits and mutating shell commands are denied in this mode."
         ),
         PermissionMode::WorkspaceWrite => format!(
-            "You are a coding assistant with read/list/glob/grep/write{git_blurb}{rag_blurb}. Workspace root: {root_s}. \
-             Relative paths only; no `..`."
+            "You are a coding assistant with read and write access inside the workspace root: {root_s}{rag_blurb}. \
+             Keep paths under the workspace."
         ),
         PermissionMode::Prompt => format!(
-            "You are a coding assistant in prompt-style permission mode (workspace root: {root_s}). \
-             Read/list/glob/grep{git_blurb}{rag_blurb} tools available; `write_file` is gated — in this harness writes require workspace-write or higher unless an interactive prompt is available (non-interactive runs deny writes per PolicyEnforcer)."
+            "You are a coding assistant in prompt-style permission mode (workspace root: {root_s}){rag_blurb}. \
+             Writes are gated — in this harness they require workspace-write or higher unless an interactive prompt is available (non-interactive runs deny writes per PolicyEnforcer)."
         ),
         PermissionMode::DangerFullAccess | PermissionMode::Allow => format!(
-            "You are a coding assistant with read/list/glob/grep/write{git_blurb}{rag_blurb} and expanded permission mode '{}' (workspace root: {root_s}). \
-             Still use only the provided tools; paths must stay under workspace.",
+            "You are a coding assistant in expanded permission mode '{}' (workspace root: {root_s}){rag_blurb}. \
+             Still use only the provided tools; paths must stay under the workspace.",
             mode.as_str()
         ),
     };
@@ -1149,7 +1072,7 @@ pub fn print_tools_dry_run(
     rag_base_url: Option<&str>,
     out: &mut impl io::Write,
 ) -> std::io::Result<()> {
-    let tools = tool_definitions(permission_mode, rag_base_url);
+    let tools = tool_definitions(rag_base_url);
     writeln!(out, "claw-analog — effective tools (dry-run, no API calls)")?;
     writeln!(
         out,
@@ -1340,7 +1263,7 @@ pub async fn run(
     } else {
         None
     };
-    let tools = tool_definitions(config.permission_mode, config.rag_base_url.as_deref());
+    let tools = tool_definitions(config.rag_base_url.as_deref());
     let profile_ref = config.profile_hint.as_deref();
     let system = system_prompt(
         config.permission_mode,
@@ -1474,7 +1397,6 @@ pub async fn run(
                     tu.name,
                     tu.input,
                     &workspace,
-                    &ws_str,
                     config.permission_mode,
                     config.use_runtime_enforcer.then_some(&enforcer),
                     config.max_read_bytes,
@@ -2056,7 +1978,6 @@ pub fn dispatch_tool(
     name: &str,
     input: &Value,
     workspace: &Path,
-    workspace_str: &str,
     mode: PermissionMode,
     enforcer: Option<&PermissionEnforcer>,
     max_read: u64,
@@ -2066,36 +1987,6 @@ pub fn dispatch_tool(
     glob_max_depth: usize,
 ) -> String {
     match name {
-        "read_file" => {
-            if let Err(e) = enforce_tool(enforcer, name, input) {
-                return format!("error: permission denied: {e}");
-            }
-            let Some(path_s) = input.get("path").and_then(|p| p.as_str()) else {
-                return "error: missing path".to_string();
-            };
-            let Ok(full) = join_under_root(workspace, path_s) else {
-                return format!("error: invalid path {path_s:?}");
-            };
-            if let Err(e) = assert_workspace_path(workspace, &full) {
-                return format!("error: {e}");
-            }
-            match std::fs::read(&full) {
-                Ok(bytes) => {
-                    if bytes.iter().take(8 * 1024).any(|b| *b == 0) {
-                        return "error: file looks binary (NUL byte)".to_string();
-                    }
-                    if bytes.len() as u64 > max_read {
-                        return format!(
-                            "error: file too large ({} bytes; max {})",
-                            bytes.len(),
-                            max_read
-                        );
-                    }
-                    String::from_utf8_lossy(&bytes).into_owned()
-                }
-                Err(e) => format!("error: read failed: {e}"),
-            }
-        }
         "list_dir" => {
             if let Err(e) = enforce_tool(enforcer, "list_dir", input) {
                 return format!("error: permission denied: {e}");
@@ -2194,66 +2085,8 @@ pub fn dispatch_tool(
                 glob_max_depth,
             )
         }
-        "grep_search" => {
-            if let Err(e) = enforce_tool(enforcer, name, input) {
-                return format!("error: permission denied: {e}");
-            }
-            dispatch_grep_workspace(
-                input,
-                workspace,
-                max_read,
-                grep_cap,
-                glob_max_paths,
-                glob_max_depth,
-            )
-        }
         "retrieve_context" => {
             "error: retrieve_context runs via async HTTP only (configure RAG_BASE_URL)".to_string()
-        }
-        "write_file" => {
-            if !matches!(
-                mode,
-                PermissionMode::WorkspaceWrite
-                    | PermissionMode::DangerFullAccess
-                    | PermissionMode::Allow
-            ) {
-                return format!(
-                    "error: write_file requires workspace-write, danger-full-access, or allow (current: {})",
-                    mode.as_str()
-                );
-            }
-            if let Err(e) = enforce_tool(enforcer, name, input) {
-                return format!("error: permission denied: {e}");
-            }
-            let Some(path_s) = input.get("path").and_then(|p| p.as_str()) else {
-                return "error: missing path".to_string();
-            };
-            let Some(content) = input.get("content").and_then(|p| p.as_str()) else {
-                return "error: missing content".to_string();
-            };
-            let Ok(full) = join_under_root(workspace, path_s) else {
-                return format!("error: invalid path {path_s:?}");
-            };
-            if let Err(e) = assert_workspace_path(workspace, &full) {
-                return format!("error: {e}");
-            }
-            if let Some(e) = enforcer {
-                match e.check_file_write(&full.display().to_string(), workspace_str) {
-                    EnforcementResult::Allowed => {}
-                    EnforcementResult::Denied { reason, .. } => {
-                        return format!("error: permission denied: {reason}");
-                    }
-                }
-            }
-            if let Some(parent) = full.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    return format!("error: mkdir: {e}");
-                }
-            }
-            match std::fs::write(&full, content.as_bytes()) {
-                Ok(()) => format!("wrote {} bytes to {}", content.len(), full.display()),
-                Err(e) => format!("error: write failed: {e}"),
-            }
         }
         "git_diff" => {
             if let Err(e) = enforce_tool(enforcer, name, input) {
@@ -2535,7 +2368,7 @@ mod tests {
     }
 
     #[test]
-    fn grep_paths_and_glob_and_grep_search_alias() {
+    fn grep_paths_and_glob_selectors() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         std::fs::write(root.join("a.txt"), "one xhere\n").unwrap();
@@ -2561,21 +2394,6 @@ mod tests {
             16,
         );
         assert!(out_g.contains("a.txt:") || out_g.contains("b.txt:"));
-
-        let alias = dispatch_tool(
-            "grep_search",
-            &json!({ "path": "a.txt", "pattern": "xhere" }),
-            &root,
-            &root.display().to_string(),
-            PermissionMode::ReadOnly,
-            None,
-            4096,
-            100,
-            50,
-            2000,
-            32,
-        );
-        assert!(alias.contains("1:"));
     }
 
     #[test]
@@ -2693,27 +2511,27 @@ mod tests {
     }
 
     #[test]
-    fn print_tools_dry_run_lists_read_only_tools() {
+    fn print_tools_dry_run_lists_the_main_branch_toolset() {
         let mut buf = Vec::new();
         print_tools_dry_run(PermissionMode::ReadOnly, true, None, &mut buf).unwrap();
         let s = String::from_utf8_lossy(&buf);
+        // Advertised in every mode now; the mode only gates execution.
         assert!(s.contains("read_file"));
-        assert!(!s.contains("write_file"));
+        assert!(s.contains("write_file"));
+        assert!(s.contains("bash"));
+        // Branch-only tools stay out, and RAG is opt-in.
+        assert!(!s.contains("GitStatus"));
+        assert!(!s.contains("glob_workspace"));
         assert!(!s.contains("retrieve_context"));
         let mut buf2 = Vec::new();
-        print_tools_dry_run(PermissionMode::WorkspaceWrite, true, None, &mut buf2).unwrap();
-        let s2 = String::from_utf8_lossy(&buf2);
-        assert!(s2.contains("write_file"));
-        let mut buf3 = Vec::new();
         print_tools_dry_run(
             PermissionMode::ReadOnly,
             true,
             Some("http://127.0.0.1:8787"),
-            &mut buf3,
+            &mut buf2,
         )
         .unwrap();
-        let s3 = String::from_utf8_lossy(&buf3);
-        assert!(s3.contains("retrieve_context"));
+        assert!(String::from_utf8_lossy(&buf2).contains("retrieve_context"));
     }
 
     #[test]
@@ -2839,12 +2657,10 @@ glob_max_paths = 100
         git(root, &["commit", "-m", "initial", "--quiet"]);
         std::fs::write(root.join("a.txt"), "a!\n").expect("modify a");
 
-        let ws_str = root.display().to_string();
         let log_out = dispatch_tool(
             "git_log",
             &json!({"max_count": 5}),
             root,
-            &ws_str,
             PermissionMode::ReadOnly,
             None,
             256 * 1024,
@@ -2859,7 +2675,6 @@ glob_max_paths = 100
             "git_diff",
             &json!({}),
             root,
-            &ws_str,
             PermissionMode::ReadOnly,
             None,
             256 * 1024,
@@ -2889,7 +2704,7 @@ glob_max_paths = 100
         let _g1 = EnvVarGuard::set("ANTHROPIC_API_KEY", "sk-test-mock");
         let _g2 = EnvVarGuard::set("ANTHROPIC_BASE_URL", url.as_str());
 
-        let config = AnalogConfig {
+        let mut config = AnalogConfig {
             model: "claude-sonnet-4-6".into(),
             workspace: root.clone(),
             permission_mode: PermissionMode::ReadOnly,
@@ -2914,8 +2729,14 @@ glob_max_paths = 100
             rag_top_k_max: 32,
         };
 
+        // The binary chdirs into the workspace before the loop; do the same so
+        // the shared `read_file` resolves the fixture instead of refusing.
+        let previous = std::env::current_dir().expect("cwd");
+        enter_workspace(&mut config).expect("enter workspace");
         let mut out = Vec::new();
-        run(config, &mut out).await.expect("run");
+        let result = run(config, &mut out).await;
+        std::env::set_current_dir(previous).expect("restore cwd");
+        result.expect("run");
 
         let text = String::from_utf8_lossy(&out);
         assert!(
@@ -3076,7 +2897,6 @@ glob_max_paths = 100
             name,
             input,
             workspace,
-            &workspace.display().to_string(),
             mode,
             None,
             64 * 1024,
@@ -3088,39 +2908,53 @@ glob_max_paths = 100
     }
 
     #[test]
-    fn tool_definitions_expose_shared_builtins() {
-        let names = |mode| {
-            tool_definitions(mode, None)
-                .into_iter()
-                .map(|t| t.name)
-                .collect::<Vec<_>>()
-        };
-        let read_only = names(PermissionMode::ReadOnly);
-        for expected in ["read_file", "bash", "edit_file", "glob_search", "GitStatus"] {
+    fn tool_definitions_match_the_main_branch_toolset() {
+        let names = tool_definitions(None)
+            .into_iter()
+            .map(|t| t.name)
+            .collect::<Vec<_>>();
+        // Every advertised tool is one `main` also defines.
+        for name in &names {
             assert!(
-                read_only.iter().any(|n| n == expected),
-                "{expected} missing from {read_only:?}"
+                MAIN_BRANCH_TOOL_NAMES.contains(&name.as_str()),
+                "{name} is not part of the main-branch toolset"
             );
         }
-        // Nothing is deferred here, so there is nothing for ToolSearch to find.
-        assert!(!read_only.iter().any(|n| n == "ToolSearch"));
-        // Native specs win over shared ones with the same name.
-        assert_eq!(read_only.iter().filter(|n| *n == "read_file").count(), 1);
-        assert_eq!(read_only.iter().filter(|n| *n == "write_file").count(), 0);
-        assert_eq!(
-            names(PermissionMode::WorkspaceWrite)
-                .iter()
-                .filter(|n| *n == "write_file")
-                .count(),
-            1
-        );
+        for expected in [
+            "read_file",
+            "write_file",
+            "grep_search",
+            "bash",
+            "edit_file",
+        ] {
+            assert!(names.iter().any(|n| n == expected), "{expected} missing");
+        }
+        // Branch-only tools and the analog's old workspace tools are gone.
+        for gone in [
+            "GitStatus",
+            "GitDiff",
+            "GitBlame",
+            "list_dir",
+            "glob_workspace",
+            "grep_workspace",
+            "git_diff",
+            "git_log",
+        ] {
+            assert!(!names.iter().any(|n| n == gone), "{gone} still advertised");
+        }
+        assert_eq!(names.iter().filter(|n| *n == "read_file").count(), 1);
+        // RAG stays opt-in.
+        assert!(!names.iter().any(|n| n == "retrieve_context"));
+        assert!(tool_definitions(Some("http://127.0.0.1:8787"))
+            .iter()
+            .any(|t| t.name == "retrieve_context"));
     }
 
     #[test]
     fn shared_web_tools_follow_the_disable_switch() {
         let _lock = mock_env_lock();
         let _guard = EnvVarGuard::set("CLAW_DISABLE_WEB_TOOLS", "1");
-        let names = tool_definitions(PermissionMode::ReadOnly, None)
+        let names = tool_definitions(None)
             .into_iter()
             .map(|t| t.name)
             .collect::<Vec<_>>();
@@ -3152,7 +2986,6 @@ glob_max_paths = 100
             "Agent",
             &json!({ "prompt": "do a thing" }),
             &ws,
-            &ws.display().to_string(),
             PermissionMode::ReadOnly,
             Some(&enforcer),
             64 * 1024,
