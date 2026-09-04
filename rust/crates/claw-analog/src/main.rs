@@ -497,7 +497,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
-    let config = build_config(
+    let mut config = build_config(
         &cli,
         &file_cfg,
         prompt,
@@ -506,6 +506,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         preset,
         permission_mode,
     );
+    // Shared built-ins (`bash`, `edit_file`, …) are jailed to the process cwd.
+    claw_analog::enter_workspace(&mut config)?;
     let output_format = config.output_format;
 
     let mut out = std::io::stdout();

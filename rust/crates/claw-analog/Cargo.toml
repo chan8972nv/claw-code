@@ -24,6 +24,7 @@ runtime = { path = "../runtime" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tools = { path = "../tools" }
 toml = "0.8"
 walkdir = "2"
 ignore = "0.4"

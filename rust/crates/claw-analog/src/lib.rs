@@ -20,6 +20,7 @@ use runtime::permission_enforcer::{EnforcementResult, PermissionEnforcer};
 pub use runtime::PermissionMode;
 use runtime::PermissionPolicy;
 use serde_json::{json, Value};
+use tools::{mvp_tool_specs, GlobalToolRegistry, ToolSpec};
 
 /// Refuses unrestricted permission modes in non-interactive runs unless explicitly opted in (same spirit as full `claw` CLI).
 pub fn enforce_non_interactive_permission_rules(
@@ -867,8 +868,60 @@ fn run_git_capped(workspace: &Path, args: &[String], cap: usize) -> Result<Strin
     }
 }
 
+/// Tools the analog implements itself (workspace-relative paths, own caps).
+/// A shared spec with one of these names is skipped so the analog semantics win.
+const NATIVE_TOOL_NAMES: [&str; 9] = [
+    "read_file",
+    "list_dir",
+    "glob_workspace",
+    "grep_workspace",
+    "grep_search",
+    "git_diff",
+    "git_log",
+    "retrieve_context",
+    "write_file",
+];
+
+/// Every built-in of the shared `tools` crate that the analog does not
+/// implement natively — `bash`, `edit_file`, `glob_search`, the web/task/worker/
+/// git/MCP families, and so on. `ToolSearch` is dropped: the analog advertises
+/// every spec up front, so there is nothing deferred to search for.
+fn shared_tool_specs() -> Vec<ToolSpec> {
+    let web_disabled = tools::web_tools_disabled();
+    mvp_tool_specs()
+        .into_iter()
+        .filter(|spec| spec.name != "ToolSearch" && !NATIVE_TOOL_NAMES.contains(&spec.name))
+        .filter(|spec| !(web_disabled && tools::WEB_TOOL_NAMES.contains(&spec.name)))
+        .collect()
+}
+
+/// Shared tools whose required mode the `tools` registry derives from the
+/// call's input, so the registry's own check is finer than the spec's static
+/// requirement. The web tools gate on a fixed mode equal to their spec, and
+/// everything else the registry executes with no check at all.
+const CALL_TIME_CLASSIFIED_TOOLS: [&str; 3] = ["bash", "edit_file", "glob_search"];
+
+/// Registry used to execute shared built-ins. The enforcer (when the run has
+/// one) gives the same call-time classification the main CLI applies — e.g. a
+/// read-only `bash` command is allowed in read-only mode, a mutating one is not.
+fn shared_tool_registry(enforcer: Option<&PermissionEnforcer>) -> GlobalToolRegistry {
+    let mut registry = GlobalToolRegistry::builtin();
+    if let Some(enforcer) = enforcer {
+        registry.set_enforcer(enforcer.clone());
+    }
+    registry
+}
+
 fn build_policy(mode: PermissionMode) -> PermissionPolicy {
-    PermissionPolicy::new(mode)
+    let policy = PermissionPolicy::new(mode);
+    // Unregistered tools default to requiring danger-full-access, so every
+    // shared built-in has to carry its own requirement into the policy.
+    let policy = shared_tool_specs()
+        .into_iter()
+        .fold(policy, |policy, spec| {
+            policy.with_tool_requirement(spec.name, spec.required_permission)
+        });
+    policy
         .with_tool_requirement("read_file", PermissionMode::ReadOnly)
         .with_tool_requirement("list_dir", PermissionMode::ReadOnly)
         .with_tool_requirement("glob_workspace", PermissionMode::ReadOnly)
@@ -1017,8 +1070,19 @@ fn tool_definitions(mode: PermissionMode, rag_base_url: Option<&str>) -> Vec<Too
             }),
         });
     }
+    // Shared built-ins are advertised in every mode, exactly as the main CLI
+    // does; execution is gated per call (see `dispatch_tool`).
+    tools.extend(shared_tool_specs().into_iter().map(|spec| ToolDefinition {
+        name: spec.name.to_string(),
+        description: Some(spec.description.to_string()),
+        input_schema: spec.input_schema,
+    }));
     tools
 }
+
+/// Explains the shared `tools` built-ins that sit alongside the analog's own
+/// workspace tools (`bash`, `edit_file`, web, task/worker, git, MCP, …).
+const SHARED_TOOLS_HINT: &str = "Alongside the workspace tools above you also have the shared claw built-ins (`bash`, `edit_file`, `glob_search`, `TodoWrite`, `WebFetch`/`WebSearch`, the Git*/Task*/Worker*/MCP families, and more). They are listed in every permission mode but gated per call, so one may still be denied under the active mode. Their paths resolve against the process working directory, which is the workspace root; the workspace-relative tools above stay the cheapest way to read and search this repo.";
 
 /// Nudge models away from answering “implementation” questions from ops wiring alone.
 const SOURCE_GROUNDING_HINT: &str = "When asked where something is implemented or how an internal pipeline works, ground the answer in program source (e.g. crate modules, `main`/CLI entrypoints), not only deployment manifests (`docker-compose`, CI YAML, shell scripts) unless the question is explicitly about ops. Open the relevant service sources before concluding. If `list_dir`/`glob_workspace` under a short name (e.g. a service folder) returns empty, this repo is often a monorepo: try `glob_workspace` with `root` `.` and a broad `pattern` such as `**/claw-rag-service/**/*.rs` or `rust/crates/**/src/**/*.rs` before concluding the code is missing.";
@@ -1058,6 +1122,8 @@ fn system_prompt(
         ),
     };
     let mut out = base;
+    out.push('\n');
+    out.push_str(SHARED_TOOLS_HINT);
     out.push('\n');
     out.push_str(SOURCE_GROUNDING_HINT);
     if let Some(x) = preset.extra_system() {
@@ -1214,6 +1280,42 @@ async fn retrieve_context_tool(
         Ok(s) => s,
         Err(e) => format!("error: {e}\nraw: {text}"),
     }
+}
+
+/// Resolve a possibly relative path against the current working directory.
+fn absolutize_against_cwd(path: PathBuf) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+/// Make the workspace the process working directory.
+///
+/// The shared built-ins (`bash`, `edit_file`, `glob_search`, …) jail paths to
+/// the process cwd, and [`dispatch_tool`] refuses to run them while the cwd is
+/// somewhere other than the workspace. Binaries call this once before [`run`];
+/// it is deliberately not inside `run`, because chdir is process-global and
+/// would yank the cwd out from under in-process embedders. Session paths are
+/// pinned to absolute first, since they may be relative to the old cwd.
+pub fn enter_workspace(config: &mut AnalogConfig) -> io::Result<PathBuf> {
+    let workspace = config.workspace.canonicalize()?;
+    config.session_path = config
+        .session_path
+        .take()
+        .map(absolutize_against_cwd)
+        .transpose()?;
+    config.session_save_path = config
+        .session_save_path
+        .take()
+        .map(absolutize_against_cwd)
+        .transpose()?;
+    config.workspace.clone_from(&workspace);
+    if std::env::current_dir()? != workspace {
+        std::env::set_current_dir(&workspace)?;
+    }
+    Ok(workspace)
 }
 
 /// Run the agent loop; assistant text is written to `out` (streaming deltas when `use_stream`).
@@ -2267,9 +2369,53 @@ pub fn dispatch_tool(
                 Err(e) => format!("error: {e}"),
             }
         }
-        _ => {
-            format!("error: unknown tool {name} (input {input})")
+        _ => dispatch_shared_tool(name, input, workspace, mode, enforcer),
+    }
+}
+
+/// Execute a built-in of the shared `tools` crate.
+///
+/// Those tools jail paths to the *process* working directory, so the analog
+/// workspace has to be the cwd — [`run`] chdirs into it before the tool loop.
+/// A mismatch means the jail would point somewhere else, so the call is
+/// refused rather than silently escaping the workspace.
+fn dispatch_shared_tool(
+    name: &str,
+    input: &Value,
+    workspace: &Path,
+    mode: PermissionMode,
+    enforcer: Option<&PermissionEnforcer>,
+) -> String {
+    let Some(spec) = shared_tool_specs().into_iter().find(|s| s.name == name) else {
+        return format!("error: unknown tool {name} (input {input})");
+    };
+    // The shared registry classifies a few tools from their input (a read-only
+    // `bash` command is allowed in read-only mode, a mutating one is not) and
+    // gates them itself, but only when it has an enforcer. Everything else it
+    // executes ungated, so the spec's static requirement is the gate here.
+    let classified_by_registry =
+        enforcer.is_some() && CALL_TIME_CLASSIFIED_TOOLS.contains(&spec.name);
+    if !classified_by_registry && mode < spec.required_permission {
+        return format!(
+            "error: {name} requires {} (current: {})",
+            spec.required_permission.as_str(),
+            mode.as_str()
+        );
+    }
+    match std::env::current_dir().and_then(|cwd| cwd.canonicalize()) {
+        Ok(cwd) if cwd == workspace => {}
+        Ok(cwd) => {
+            return format!(
+                "error: {name} is jailed to the process working directory ({}), which is not the workspace ({})",
+                cwd.display(),
+                workspace.display()
+            );
         }
+        Err(e) => return format!("error: cannot resolve working directory: {e}"),
+    }
+    match shared_tool_registry(enforcer).execute(name, input) {
+        Ok(output) => output,
+        Err(e) => format!("error: {e}"),
     }
 }
 
@@ -2918,6 +3064,140 @@ glob_max_paths = 100
         );
 
         assert!(types.contains(&"run_end"), "types={types:?}");
+    }
+
+    fn dispatch_in_workspace(
+        name: &str,
+        input: &Value,
+        workspace: &Path,
+        mode: PermissionMode,
+    ) -> String {
+        dispatch_tool(
+            name,
+            input,
+            workspace,
+            &workspace.display().to_string(),
+            mode,
+            None,
+            64 * 1024,
+            200,
+            200,
+            200,
+            8,
+        )
+    }
+
+    #[test]
+    fn tool_definitions_expose_shared_builtins() {
+        let names = |mode| {
+            tool_definitions(mode, None)
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        };
+        let read_only = names(PermissionMode::ReadOnly);
+        for expected in ["read_file", "bash", "edit_file", "glob_search", "GitStatus"] {
+            assert!(
+                read_only.iter().any(|n| n == expected),
+                "{expected} missing from {read_only:?}"
+            );
+        }
+        // Nothing is deferred here, so there is nothing for ToolSearch to find.
+        assert!(!read_only.iter().any(|n| n == "ToolSearch"));
+        // Native specs win over shared ones with the same name.
+        assert_eq!(read_only.iter().filter(|n| *n == "read_file").count(), 1);
+        assert_eq!(read_only.iter().filter(|n| *n == "write_file").count(), 0);
+        assert_eq!(
+            names(PermissionMode::WorkspaceWrite)
+                .iter()
+                .filter(|n| *n == "write_file")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn shared_web_tools_follow_the_disable_switch() {
+        let _lock = mock_env_lock();
+        let _guard = EnvVarGuard::set("CLAW_DISABLE_WEB_TOOLS", "1");
+        let names = tool_definitions(PermissionMode::ReadOnly, None)
+            .into_iter()
+            .map(|t| t.name)
+            .collect::<Vec<_>>();
+        assert!(!names.iter().any(|n| n == "WebFetch"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "WebSearch"), "{names:?}");
+    }
+
+    #[test]
+    fn shared_tool_without_enforcer_falls_back_to_static_requirement() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().canonicalize().expect("canonicalize");
+        let out = dispatch_in_workspace(
+            "bash",
+            &json!({ "command": "echo hi" }),
+            &ws,
+            PermissionMode::ReadOnly,
+        );
+        assert!(out.starts_with("error: bash requires"), "{out}");
+    }
+
+    #[test]
+    fn unclassified_shared_tool_is_gated_even_with_an_enforcer() {
+        // The registry runs `Agent` without any permission check of its own,
+        // so the analog has to apply the spec's requirement itself.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().canonicalize().expect("canonicalize");
+        let enforcer = PermissionEnforcer::new(build_policy(PermissionMode::ReadOnly));
+        let out = dispatch_tool(
+            "Agent",
+            &json!({ "prompt": "do a thing" }),
+            &ws,
+            &ws.display().to_string(),
+            PermissionMode::ReadOnly,
+            Some(&enforcer),
+            64 * 1024,
+            200,
+            200,
+            200,
+            8,
+        );
+        assert!(out.starts_with("error: Agent requires"), "{out}");
+    }
+
+    #[test]
+    fn shared_tool_refuses_when_cwd_is_not_the_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().canonicalize().expect("canonicalize");
+        // Tests run from the crate directory, never from the temp workspace.
+        let out = dispatch_in_workspace(
+            "glob_search",
+            &json!({ "pattern": "**/*.rs" }),
+            &ws,
+            PermissionMode::ReadOnly,
+        );
+        assert!(
+            out.contains("jailed to the process working directory"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_glob_search_runs_against_the_workspace() {
+        // Serialized against the `run`-based tests: both move the process cwd.
+        let _lock = mock_env_lock_async().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().canonicalize().expect("canonicalize");
+        std::fs::write(ws.join("alpha.rs"), "fn main() {}\n").expect("write");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&ws).expect("enter workspace");
+        let out = dispatch_in_workspace(
+            "glob_search",
+            &json!({ "pattern": "*.rs" }),
+            &ws,
+            PermissionMode::ReadOnly,
+        );
+        std::env::set_current_dir(previous).expect("restore cwd");
+        assert!(out.contains("alpha.rs"), "{out}");
     }
 
     struct EnvVarGuard {

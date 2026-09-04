@@ -240,8 +240,11 @@ pub fn run_agents(args: AgentsCli) -> Result<(), String> {
 }
 
 pub async fn run_agents_async(args: AgentsCli) -> Result<(), String> {
-    run_agents_inner(args, |cfg, out| {
+    run_agents_inner(args, |mut cfg, out| {
         Box::pin(async move {
+            // Shared built-ins are jailed to the process cwd; agents all share
+            // one workspace, so this is a no-op after the first.
+            claw_analog::enter_workspace(&mut cfg).map_err(|e| e.to_string())?;
             claw_analog::run(cfg, out)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -253,7 +256,7 @@ pub async fn run_agents_async(args: AgentsCli) -> Result<(), String> {
 
 type RunFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + 'a>>;
 
-async fn run_agents_inner<F>(args: AgentsCli, mut run_one: F) -> Result<(), String>
+async fn run_agents_inner<F>(mut args: AgentsCli, mut run_one: F) -> Result<(), String>
 where
     for<'a> F: FnMut(AnalogConfig, &'a mut Vec<u8>) -> RunFuture<'a>,
 {
@@ -264,6 +267,13 @@ where
             .map_err(|e| e.to_string())?
             .join(&args.workspace)
     };
+    // Pin the session paths before the run moves the process cwd into the
+    // workspace (see `claw_analog::enter_workspace`).
+    if !args.base_session.is_absolute() {
+        args.base_session = std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(&args.base_session);
+    }
     let cfg_path = config_path(&args);
     let file_cfg = load_file_config(&cfg_path);
 
